@@ -355,9 +355,6 @@ on the air.
 
 ## License
 
-Suggested: **MIT** (add a `LICENSE` file). If you reuse code derived from GPL-licensed
-projects such as MicroModem, review and honor their license terms before publishing.
+GPL-3
 
 ---
-
-*Author: Your Name / CALLSIGN — replace this line before publishing.*
