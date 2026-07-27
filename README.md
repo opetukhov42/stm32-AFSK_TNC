@@ -2,14 +2,14 @@
 
 A self-contained **1200-baud packet-radio TNC** (Terminal Node Controller) for the STM32F103C8T6 "Blue Pill"[cite: 1]. It implements the complete AFSK modem and AX.25 stack in firmware — **no external DSP or APRS library required**[cite: 1]. Everything (Bell-202 modulation/demodulation, HDLC framing, bit-stuffing, NRZI, CRC, and the AX.25 v2.2 link layer) runs on the bare microcontroller using one PWM output for transmit audio and the ADC for receive audio[cite: 1].
 
-> ⚠️ **Amateur radio license required to transmit.** Set `MYCALL` to *your own* callsign, never transmit as `NOCALL`, and bench-test into a dummy load first[cite: 1]. You are responsible for your emissions[cite: 1].
+> ⚠️ **Amateur radio license required to transmit.**[cite: 1] Set `MYCALL` to *your own* callsign, never transmit as `NOCALL`, and bench-test into a dummy load first[cite: 1]. You are responsible for your emissions[cite: 1].
 
 ---
 
 ## Features
 
 - **AFSK 1200 (Bell 202)** modem — 1200 Hz / 2200 Hz, NRZI, HDLC, CRC-16/X.25 FCS[cite: 1].
-- **KISS mode** — works as a dumb TNC for Dire Wolf, APRSISCE/32, Xastir, UI-View, YAAC, etc[cite: 1].
+- **KISS mode** — works as a dumb TNC for Dire Wolf, APRSISCE/32, Xastir, UI-View, YAAC, etc.[cite: 1].
 - **Command / Converse terminal** — TAPR TNC-2 style command line over USB serial[cite: 1].
 - **AX.25 v2.2 connected mode** — SABM/UA/DISC/DM handshakes, I-frames, RR/RNR/REJ, go-back-N retransmission, T1/T3 timers, N2 retry cap, path reversal for incoming connects[cite: 1].
 - **UI / unproto** transmit for beacons and APRS-style messages[cite: 1].
@@ -17,10 +17,10 @@ A self-contained **1200-baud packet-radio TNC** (Terminal Node Controller) for t
 - **Digipeater** — proper WIDEn-N *New Paradigm* (fill-in and wide modes) with callsign insertion and a 30 s duplicate-suppression cache[cite: 1].
 - **MHEARD** list and a **monitor** toggle[cite: 1].
 - **Status LED** — steady = idle, fast blink = traffic, slow blink = connected[cite: 1].
-- **GPS position source** — NMEA decoder on a separate serial port; beacons transmit live coordinates[cite: 1]. Includes toggle for hardware or software serial[cite: 1]. Also supports static GPS coordinates.
+- **GPS position source** — NMEA decoder on a separate serial port; beacons transmit live coordinates[cite: 1]. Includes toggle for hardware or software serial[cite: 1]. Also supports static hardcoded GPS coordinates.
 - **Weather Station Telemetry** — Manual CLI input or automatic serial parsing for APRS weather beacons using standard telemetry formats (e.g., `270/010g015t072...`)[cite: 1].
 - **Live-tunable** link parameters (`FRACK`, `RETRY`, `PACLEN`)[cite: 1].
-- **Safe Direct Flash Write** — Settings save directly to Flash Memory, avoiding USB enumeration lockups and alignment hard faults.
+- **Safe Direct Flash Write** — Settings save directly to Flash Memory using safe byte-level alignment to prevent USB enumeration lockups and hardware faults.
 
 ---
 
@@ -28,47 +28,53 @@ A self-contained **1200-baud packet-radio TNC** (Terminal Node Controller) for t
 
 ### Bill of materials
 
-| Qty | Part | Value / Type | Purpose | Reference |
-|----:|------|--------------|---------|-----------|
-| 1 | MCU board | STM32F103C8T6 "Blue Pill" | The TNC |[cite: 1] |
-| 1 | Programmer | ST-Link V2 (clone is fine) | Flashing (easiest method) |[cite: 1] |
-| 2 | Resistor | 10 kΩ | RX bias divider (mid-rail) |[cite: 1] |
-| 1 | Trimmer pot | 10 kΩ | RX audio level |[cite: 1] |
-| 1 | Capacitor | 100 nF (0.1 µF) | RX AC coupling |[cite: 1] |
-| 1 | Capacitor | 10 nF | RX anti-alias (optional) |[cite: 1] |
-| 2 | Resistor | 4.7 kΩ | TX low-pass filter |[cite: 1] |
-| 2 | Capacitor | 10 nF | TX low-pass filter |[cite: 1] |
-| 1 | Capacitor | 1 µF (or 100 nF) | TX AC coupling |[cite: 1] |
-| 1 | Trimmer pot | 10 kΩ | TX level / deviation |[cite: 1] |
-| 1 | Transistor | NPN, 2N3904 / BC547 / 2N2222 | PTT switch |[cite: 1] |
-| 1 | Resistor | 1 kΩ | PTT base |[cite: 1] |
-| 1 | Resistor | 10 kΩ | PTT base pull-down (optional) |[cite: 1] |
-| 1 | GPS module | NMEA @ 3.3 V logic (u-blox NEO-6M/7M/8M etc.) | Position source (optional) |[cite: 1] |
-| 1 | Weather sensor | Serial weather instrument | Weather source (optional) |[cite: 1] |
+| Qty | Part | Value / Type | Purpose |
+|----:|------|--------------|---------|
+| 1 | MCU board | STM32F103C8T6 "Blue Pill" | The TNC[cite: 1] |
+| 1 | Programmer | ST-Link V2 (clone is fine) | Flashing (easiest method)[cite: 1] |
+| 2 | Resistor | 10 kΩ | RX bias divider (mid-rail)[cite: 1] |
+| 1 | Trimmer pot | 10 kΩ | RX audio level[cite: 1] |
+| 1 | Capacitor | 100 nF (0.1 µF) | RX AC coupling[cite: 1] |
+| 1 | Capacitor | 10 nF | RX anti-alias (optional)[cite: 1] |
+| 2 | Resistor | 4.7 kΩ | TX low-pass filter[cite: 1] |
+| 2 | Capacitor | 10 nF | TX low-pass filter[cite: 1] |
+| 1 | Capacitor | 1 µF (or 100 nF) | TX AC coupling[cite: 1] |
+| 1 | Trimmer pot | 10 kΩ | TX level / deviation[cite: 1] |
+| 1 | Transistor | NPN, 2N3904 / BC547 / 2N2222 | PTT switch[cite: 1] |
+| 1 | Resistor | 1 kΩ | PTT base[cite: 1] |
+| 1 | Resistor | 10 kΩ | PTT base pull-down (optional)[cite: 1] |
+| 1 | GPS module | NMEA @ 3.3 V logic (u-blox NEO-6M/7M/8M etc.) | Position source (optional)[cite: 1] |
+| 1 | Weather sensor | Serial weather instrument | Weather source (optional)[cite: 1] |
+| *2* | *Audio Transformer* | *1:1 600Ω Isolation* | *(Isolated Option Only)* |
+| *1* | *Optocoupler* | *PC817, 4N25, or similar* | *(Isolated Option Only)* |
+| *1* | *Resistor* | *330 Ω* | *(Isolated Option Only)* |
 
 You'll also need a cable/connector appropriate to your radio (HT 2.5/3.5 mm jacks, or a mobile's 6-pin mini-DIN "DATA" port)[cite: 1]. The onboard **PC13 LED** is used for status, so no external LED is required[cite: 1].
 
 ### Pin map
 
-| Signal | STM32 pin | Direction | Notes | Reference |
-|--------|-----------|-----------|-------|-----------|
-| RX audio in | **PA0** | analog in (ADC) | AC-coupled, biased to 1.65 V |[cite: 1] |
-| TX audio out | **PA1** | PWM out | ~281 kHz PWM, RC-filtered to audio |[cite: 1] |
-| PTT | **PA4** | digital out | drives NPN, HIGH = keyed |[cite: 1] |
-| Status LED | **PC13** | digital out | onboard LED (active LOW) |[cite: 1] |
-| GPS in | **PB11** | serial RX | from GPS TX (USART3 or SoftSerial) |[cite: 1] |
-| GPS out | **PB10** | serial TX | to GPS RX (USART3 or SoftSerial) |[cite: 1] |
-| Weather in | **PA3** | serial RX | from WX TX (USART2 or SoftSerial) |[cite: 1] |
-| Weather out | **PA2** | serial TX | to WX RX (USART2 or SoftSerial) |[cite: 1] |
-| Console | USB (CDC) | serial | 115200 baud, 8N1 |[cite: 1] |
+| Signal | STM32 pin | Direction | Notes |
+|--------|-----------|-----------|-------|
+| RX audio in | **PA0** | analog in (ADC) | AC-coupled, biased to 1.65 V[cite: 1] |
+| TX audio out | **PA1** | PWM out | ~281 kHz PWM, RC-filtered to audio[cite: 1] |
+| PTT | **PA4** | digital out | drives NPN, HIGH = keyed[cite: 1] |
+| Status LED | **PC13** | digital out | onboard LED (active LOW)[cite: 1] |
+| GPS in | **PB11** | serial RX | from GPS TX (USART3 or SoftSerial)[cite: 1] |
+| GPS out | **PB10** | serial TX | to GPS RX (USART3 or SoftSerial)[cite: 1] |
+| Weather in | **PA3** | serial RX | from WX TX (USART2 or SoftSerial)[cite: 1] |
+| Weather out | **PA2** | serial TX | to WX RX (USART2 or SoftSerial)[cite: 1] |
+| Console | USB (CDC) | serial | 115200 baud, 8N1[cite: 1] |
 
 ---
 
 ## Connecting to the radio
 
-The three signal paths are: **receive audio in**, **transmit audio out**, and **PTT**[cite: 1]. All three share a **common ground** with the radio[cite: 1]. Keep leads short[cite: 1].
+The three signal paths are: **receive audio in**, **transmit audio out**, and **PTT**[cite: 1]. 
 
-### Full wiring diagram
+Below are **two options** for wiring your TNC to the radio. Option 1 is simple and relies on a common ground. Option 2 provides complete galvanic isolation to prevent ground loops and RF interference.
+
+### OPTION 1: Direct Connection (Common Ground)
+All three lines share a **common ground** with the radio[cite: 1]. Keep leads short[cite: 1].
 
 ```text
                                STM32F103C8T6 (Blue Pill)
@@ -113,32 +119,74 @@ GND 10k Pot  │(TX level)      │                         │
                               └─────────────────────────┘
 ```
 
-### 1. Receive audio → PA0
+#### Option 1 Details:
+*   **Receive Audio (PA0):** Radio receive audio is AC-coupled and biased to half the supply (1.65 V) so the 0–3.3 V ADC can capture the full AC swing[cite: 1]. Two 10 kΩ resistors form a divider from 3.3 V to GND[cite: 1]. A 10 kΩ trimmer sets the level[cite: 1]. Aim for roughly 1–1.5 V peak-to-peak at PA0[cite: 1].
+*   **Transmit Audio (PA1):** PA1 emits a ~281 kHz PWM whose duty cycle traces the audio waveform[cite: 1]. An RC low-pass filter (two cascaded 4.7 kΩ / 10 nF stages) reconstructs the 1200/2200 Hz tones and removes the PWM carrier[cite: 1]. A 10 kΩ trimmer attenuates it down to microphone level[cite: 1].
+*   **PTT (PA4):** A small NPN transistor keys the radio by pulling its PTT line to ground[cite: 1].
 
-Radio receive audio is **AC-coupled** and **biased to half the supply (1.65 V)** so the 0–3.3 V ADC can capture the full AC swing[cite: 1].
+---
 
-- Two **10 kΩ** resistors form a divider from 3.3 V to GND; the tap sits at **1.65 V** and connects to **PA0**[cite: 1].
-- The radio audio is injected onto that tap through a **100 nF** series capacitor[cite: 1]. With the divider's ~5 kΩ source impedance this gives a high-pass corner near 320 Hz — well below the 1200/2200 Hz tones[cite: 1].
-- A **10 kΩ trimmer** in front sets the level[cite: 1]. Aim for roughly **1–1.5 V peak-to-peak** at PA0[cite: 1]. Too much clips the ADC and kills decoding; too little buries the signal in noise[cite: 1].
-- The optional **10 nF** cap from PA0 to GND is a light anti-alias/noise filter[cite: 1].
+### OPTION 2: Galvanic-Isolated Connection (Recommended)
+This option creates a physical isolation barrier between the STM32 and the radio, protecting the microcontroller from stray RF and preventing audio-corrupting ground loops. **Do not connect the STM32 Ground to the Radio Ground.**
 
-### 2. Transmit audio → radio mic
+```text
+                           ISOLATION BARRIER
+                                  │
+    STM32 (TNC SIDE)              │                 RADIO SIDE
+                                  │
+================================= │ ==============================================
+ 1. RECEIVE AUDIO (RX)            │
+================================= │
+                                  │
+                        100nF     │   1:1 Audio Transformer
+[STM32 PA0] ──────┬──────┤├───────┼── ꨄ ꨄ ───────────────< Wiper
+(ADC_IN0)         │               │   ꨄ ꨄ                  ┌─────┴─────┐
+                  │               │   ꨄ ꨄ                  │  10k Pot  │(RX level)
+ 3.3V ──[ 10k ]───┤               │   ꨄ ꨄ                  └─────┬─────┘
+                  │               │   ꨄ ꨄ                        │
+  GND ──[ 10k ]───┤               │   ꨄ ꨄ                        │
+                  │               │   ꨄ ꨄ                        │
+  GND ───┤├───────┴───────────────┼── ꨄ ꨄ ───────────────────────┴── [RADIO AF OUT]
+        10nF      (STM32 GND)     │               (RADIO GND) ───┐
+                                  │                              │
+================================= │ =============================│================
+ 2. TRANSMIT AUDIO (TX)           │                              │
+================================= │                              │
+                                  │                              │
+         4.7k      4.7k     1uF   │   1:1 Audio Transformer      │
+[STM32 ───███──┬───███──┬────┤├───┼── ꨄ ꨄ ───────────────> Wiper│
+ PA1]          │        │         │   ꨄ ꨄ                  ┌─────┴─────┐
+               ┴        ┴         │   ꨄ ꨄ                  │  10k Pot  │(TX level)
+             10nF     10nF        │   ꨄ ꨄ                  └─────┬─────┘
+               ┬        ┬         │   ꨄ ꨄ                        │
+               │        │         │   ꨄ ꨄ                        │
+  GND ─────────┴────────┴─────────┼── ꨄ ꨄ ───────────────────────┴── [RADIO MIC]
+              (STM32 GND)         │               (RADIO GND) ───┐
+                                  │                              │
+================================= │ =============================│================
+ 3. PTT (PUSH-TO-TALK)            │                              │
+================================= │                              │
+                                  │        Optocoupler           │
+                                  │      (PC817 / 4N25)          │
+         330 ohm                  │      ┌────────────┐          │
+[STM32 ───███─────────────────────┼─────>│ 1 (An)   C │──────────┼── [RADIO PTT]
+ PA4]                             │      │            │          │
+                                  │      │    LED   │/│          │
+                                  │      │     ▽    │ │ (NPN)    │
+                                  │      │    ───   │↘│          │
+  GND ────────────────────────────┼─────>│ 2 (Ca)   E │──────────┴── [RADIO GND]
+              (STM32 GND)         │      └────────────┘
+                                  │
+```
 
-PA1 emits a ~281 kHz PWM whose duty cycle traces the audio waveform[cite: 1]. An **RC low-pass filter** reconstructs the 1200/2200 Hz tones and removes the PWM carrier[cite: 1].
+#### Option 2 Details:
+*   **Receive Audio (PA0):** The 10k level trimmer is placed on the *Radio* side to prevent oversaturating the transformer coil. Audio jumps the magnetic gap to the STM32 side, where it is DC-biased to 1.65V.
+*   **Transmit Audio (PA1):** The RC filter smooths the PWM wave on the STM32 side. The 1uF capacitor blocks DC current from entering the transformer. On the radio side, the 10k pot attenuates the purely isolated signal to mic level.
+*   **PTT (PA4):** The STM32 drives the internal LED of the optocoupler. The isolated photo-transistor then shorts the radio's PTT line to the radio's ground. 
 
-- Two cascaded **4.7 kΩ / 10 nF** stages give a corner near **3.4 kHz** — passes 2200 Hz, strongly attenuates the carrier[cite: 1]. One stage works; two is cleaner[cite: 1].
-- A **100 nF (or 1 µF)** capacitor AC-couples the result[cite: 1].
-- A **10 kΩ trimmer** attenuates it down to microphone level (typically only tens of millivolts)[cite: 1]. This trimmer is your **deviation control** — see *Calibration* below[cite: 1].
+---
 
-### 3. PTT → radio
-
-A small **NPN transistor** keys the radio by pulling its PTT line to ground (how most radios and data ports key)[cite: 1].
-
-- **PA4 → 1 kΩ → base**[cite: 1]. Emitter to GND[cite: 1]. Collector to the radio's PTT line[cite: 1].
-- When PA4 goes HIGH the transistor saturates and grounds PTT[cite: 1].
-- The optional **10 kΩ** base-to-emitter resistor ensures a clean turn-off[cite: 1].
-
-### 4. GPS & Weather Station (optional)
+### GPS & Weather Station Configuration
 
 Both the GPS and Weather Station interfaces can be toggled in the firmware between hardware UART and SoftwareSerial using the `#define GPS_USE_SOFTWARE_SERIAL` and `#define WX_USE_SOFTWARE_SERIAL` flags at the top of the sketch[cite: 1].
 
@@ -153,7 +201,7 @@ Both the GPS and Weather Station interfaces can be toggled in the firmware betwe
 
 ## Default Configuration Definitions
 
-At the top of the `.ino` file, you can manually set the defaults that the board will revert to upon a fresh flash or manual `FORMAT`:
+At the top of the `.ino` file, you can manually set the default configuration parameters that the board will revert to upon a fresh flash or a manual `FORMAT` command:
 
 ```cpp
 #define DEF_MYCALL         "NOCALL"
@@ -229,9 +277,9 @@ Out of reset the TNC is in **command mode** (`cmd:` prompt)[cite: 1]. Type `HELP
 | `DIGI FILL` / `DIGI WIDE` | | Fill-in (WIDE1-1 only) or full WIDEn-N |
 | `WIDEMAX <1-7>` | | Max N handled in WIDE mode (default 2) |
 | `MYALIAS <call>` / `MYALIAS OFF` | | Extra exact-match digi alias |
-| `SAVE` | | Save settings to Flash Memory |
-| `CONFIG`, `SHOW` | | Show saved settings |
-| `FORMAT` | | Erase flash & load Defaults |
+| `SAVE` | | Save settings safely to direct Flash Memory |
+| `CONFIG`, `SHOW` | | Show currently saved settings |
+| `FORMAT` | | Erase flash & reload `#define` Defaults |
 | `KISS ON` | | Enter KISS mode |
 | `HELP` | | Command list |
 
@@ -255,15 +303,14 @@ cmd: BTEXT !4903.50N/07201.75W-STM32 TNC
 cmd: BEACON EVERY 600
 Auto-beacon every 600s.
 ```
-*(Example from[cite: 1])*
 
 ### Status LED (PC13)
 
-| Pattern | Meaning | Reference |
-|---------|---------|-----------|
-| Steady ON | Idle / ready |[cite: 1] |
-| Blink ~100 ms | Serial or on-air traffic |[cite: 1] |
-| Blink ~500 ms | Connected (AX.25 link up, or KISS attached) |[cite: 1] |
+| Pattern | Meaning |
+|---------|---------|
+| Steady ON | Idle / ready[cite: 1] |
+| Blink ~100 ms | Serial or on-air traffic[cite: 1] |
+| Blink ~500 ms | Connected (AX.25 link up, or KISS attached)[cite: 1] |
 
 ---
 
