@@ -26,6 +26,7 @@ and the ADC for receive audio.
   insertion and a 30 s duplicate-suppression cache
 - **MHEARD** list and a **monitor** toggle
 - **Status LED** — steady = idle, fast blink = traffic, slow blink = connected
+- **GPS position source** — NMEA decoder on a separate serial port; beacons transmit live coordinates
 - **Live-tunable** link parameters (`FRACK`, `RETRY`, `PACLEN`)
 
 ---
@@ -49,6 +50,7 @@ and the ADC for receive audio.
 | 1 | Transistor | NPN, 2N3904 / BC547 / 2N2222 | PTT switch |
 | 1 | Resistor | 1 kΩ | PTT base |
 | 1 | Resistor | 10 kΩ | PTT base pull-down (optional) |
+| 1 | GPS module | NMEA @ 3.3 V logic (u-blox NEO-6M/7M/8M etc.) | Position source (optional) |
 
 You'll also need a cable/connector appropriate to your radio (HT 2.5/3.5 mm jacks, or a
 mobile's 6-pin mini-DIN "DATA" port). The onboard **PC13 LED** is used for status, so no
@@ -62,6 +64,8 @@ external LED is required.
 | TX audio out | **PA1** | PWM out | ~281 kHz PWM, RC-filtered to audio |
 | PTT | **PA2** | digital out | drives NPN, HIGH = keyed |
 | Status LED | **PC13** | digital out | onboard LED (active LOW) |
+| GPS in | **PB11** | serial RX | from GPS TX (optional) |
+| GPS out | **PB10** | serial TX | to GPS RX, usually unused (optional) |
 | Console | USB (CDC) | serial | 115200 baud, 8N1 |
 
 ---
@@ -177,6 +181,34 @@ install, consider **audio isolation transformers** (600:600 Ω) on the TX and RX
 an **optocoupler** on PTT to break ground loops (hum) and keep RF out of the MCU. This is
 optional for bench testing.
 
+### 4. GPS (optional)
+
+Wire a serial NMEA GPS module for automatic position beacons:
+
+| GPS module | STM32 |
+|------------|-------|
+| TX | **PB11** (GPS in) |
+| RX | PB10 (optional — only if you configure the GPS from the TNC) |
+| VCC | 3.3 V |
+| GND | common GND |
+
+Use a **3.3 V-logic** GPS (u-blox NEO-6M/7M/8M breakouts are ideal — most run happily on
+3.3 V). Enable it with `GPS ON`; the default NMEA rate is 9600 baud (`GPS BAUD` to change).
+
+> **Serial port — choose one (flag at the top of the sketch):**
+>
+> - **`GPS_USE_SOFTWARE_SERIAL 1` :** bit-banged `SoftwareSerial` on PB11/PB10.
+>   Compiles on any board configuration. Because the modem runs a continuous 9600 Hz
+>   interrupt, some NMEA sentences may be dropped — bad ones fail the checksum and are
+>   discarded, so you still get a fix, just a little slower. Fine for beaconing.
+> - **`GPS_USE_SOFTWARE_SERIAL 0` (default):** hardware USART3 via the core's `Serial3` (no dropped
+>   bytes). Two requirements:
+>   1. **Tools → "U(S)ART support: Enabled (generic 'Serial')"** (not "Disabled"). If it's
+>      Disabled the core omits its `HardwareSerial` class and you get
+>      `cannot declare ... abstract type 'HardwareSerial'`.
+>
+>   The USB-CDC console stays on `Serial`; the GPS uses USART3 (PB11 RX / PB10 TX).
+
 ---
 
 ## Building and flashing
@@ -193,7 +225,9 @@ This firmware targets the **official STMicroelectronics Arduino core**.
 2. **Board settings** (*Tools* menu):
    - Board: **Generic STM32F1 series**
    - Board part number: **BluePill F103C8** (or **F103C8 (128K)** if your chip has 128 KB)
-   - U(S)ART support: **Enabled**
+   - U(S)ART support: **Enabled (generic 'Serial')** (any "Enabled" option works with the
+     default SoftwareSerial GPS; hardware-serial GPS specifically needs an "Enabled" one —
+     see the GPS section)
    - USB support: **CDC (generic Serial supersede U(S)ART)** — needed for the console over USB
    - Upload method: **STM32CubeProgrammer (SWD)** with an ST-Link (recommended)
 
@@ -228,6 +262,10 @@ There are three modes:
 | `FRACK [sec]` | | Retransmit timeout T1 (default 4 s) |
 | `RETRY [n]` | | Max retries N2 before link fails (default 10) |
 | `PACLEN [n]` | | Max info bytes per I-frame, 1–255 (default 128) |
+| `GPS ON` / `GPS OFF` | | Enable/disable the GPS position source |
+| `GPS BAUD <n>` | | GPS serial speed, 1200–115200 (default 9600) |
+| `GPS` | | Show GPS status and current location |
+| `SYMBOL <table><code>` | | APRS symbol, e.g. `SYMBOL /-` (house), `SYMBOL />` (car) |
 | `MHEARD` | `MH` | List recently heard stations |
 | `MONITOR ON` / `MONITOR OFF` | | Show/hide heard UI frames |
 | `BTEXT <text>` | | Set beacon payload text |
@@ -274,6 +312,24 @@ cmd: BTEXT !4903.50N/07201.75W-STM32 TNC
 cmd: BEACON EVERY 600
 Auto-beacon every 600s.
 ```
+
+With a **GPS** attached, let it supply the position instead — `BTEXT` becomes just the
+comment and the coordinates are inserted live from each fix:
+
+```
+cmd: GPS ON
+GPS ON.
+cmd: BTEXT STM32 mobile
+cmd: GPS
+GPS: ON   baud 9600
+Fix:  VALID
+Sats: 8
+Pos:  4903.500N  07201.750W
+APRS: !4903.50N/07201.75W>
+cmd: BEACON EVERY 120
+```
+When GPS is on with a valid fix, beacons send `!<lat>/<lon>>` + your `BTEXT` comment;
+with no fix (or GPS off) they fall back to sending `BTEXT` as plain text.
 
 ### Example: fill-in digipeater
 
@@ -356,5 +412,3 @@ on the air.
 ## License
 
 GPL-3
-
----

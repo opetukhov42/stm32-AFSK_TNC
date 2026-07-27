@@ -39,6 +39,46 @@
 #include <HardwareTimer.h>
 #include <math.h>
 
+// ---------------- GPS serial port ----------------
+// Two ways to talk to the GPS; pick with the flag below.
+//
+//   GPS_USE_SOFTWARE_SERIAL 1  (default): bit-banged SoftwareSerial on PB11/PB10.
+//     Compiles on any board configuration. The modem's continuous 9600 Hz ISR
+//     competes with its bit timing, so some NMEA sentences may be dropped - bad
+//     ones fail the checksum and are discarded, so you still get a fix, just a
+//     little slower. Perfectly usable for beaconing.
+//
+//   GPS_USE_SOFTWARE_SERIAL 0: hardware USART3 via the core's Serial3 instance.
+//     On this core you CANNOT declare your own HardwareSerial object (the Arduino.h
+//     chain only exposes the abstract base class), so we use the predefined Serial3.
+//     TWO things are required, both external to this file:
+//       1) Tools > "U(S)ART support" = "Enabled (generic 'Serial')" (not "Disabled").
+//       2) A file named  build_opt.h  MUST sit in this sketch's folder containing:
+//              -DENABLE_HWSERIAL3 -DPIN_SERIAL3_RX=PB11 -DPIN_SERIAL3_TX=PB10
+//          That is what actually creates the Serial3 object on USART3. Without it
+//          you get "undefined reference to `Serial3'" at link time.
+//     Your USB-CDC console stays on `Serial`. USART3 pins: PB10 = TX, PB11 = RX.
+#define GPS_USE_SOFTWARE_SERIAL 0
+#define GPS_RX_PIN PB11   // GPS TX -> here (USART3 RX)
+#define GPS_TX_PIN PB10   // GPS RX <- here (USART3 TX, usually unused)
+#if GPS_USE_SOFTWARE_SERIAL
+  #include <SoftwareSerial.h>
+  SoftwareSerial gpsSerial(GPS_RX_PIN, GPS_TX_PIN);
+#else
+  // The core expects Serial3 to exist but failed to compile it.
+  // We manually define it here using the correct 'Uart' class to satisfy the linker!
+  Uart Serial3(GPS_RX_PIN, GPS_TX_PIN);
+  // Map our gpsSerial reference to this newly created Serial3 object
+  #define gpsSerial Serial3
+#endif
+
+// APRS symbol for GPS position beacons (runtime-settable via the SYMBOL command).
+// Table id: '/' primary, '\' alternate, or an overlay char (0-9 / A-Z).
+// Code examples: '>' car, '-' house, 'b' bicycle, '[' jogger, 'k' truck, '_' wx.
+// Symbol codes are CASE-SENSITIVE.
+char aprsSymTable = '/';
+char aprsSymCode  = '>';
+
 // ---------------- Pin map ----------------
 #define PTT_PIN PA2
 #define TX_PIN  PA1   // TIM2_CH2
@@ -144,6 +184,21 @@ char     beaconText[100] = "STM32 TNC";
 bool     beaconEnabled   = false;
 uint32_t beaconInterval  = 600000UL;    // ms (default 10 min)
 uint32_t lastBeaconMs    = 0;
+
+// GPS (NMEA decoder)
+bool     gpsEnabled   = false;
+uint32_t gpsBaud      = 9600;
+bool     gpsFixValid  = false;
+char     gpsLatRaw[12] = "";            // NMEA ddmm.mmmm
+char     gpsLonRaw[12] = "";            // NMEA dddmm.mmmm
+char     gpsLatHemi   = 'N';
+char     gpsLonHemi   = 'W';
+uint8_t  gpsSats      = 0;
+char     gpsAlt[10]   = "";             // metres
+char     gpsUtc[12]   = "";             // hhmmss.ss
+uint32_t gpsLastFixMs = 0;
+char     nmea[100];
+uint8_t  nmeaLen = 0;
 
 // Digipeater (New N-Paradigm)
 enum DigiMode { DIGI_FILL, DIGI_WIDE };
@@ -340,10 +395,39 @@ void transmitTextPacket(char *payload, uint8_t len) {
 }
 
 // Send the configured beacon once
+// Convert an NMEA coordinate (ddmm.mmmm / dddmm.mmmm) + hemisphere into the
+// APRS fixed-width form ddmm.mmN / dddmm.mmW (2 decimal minutes).
+void aprsCoord(const char *raw, char hemi, char *out) {
+  int dot = -1;
+  for (int i = 0; raw[i]; i++) if (raw[i] == '.') { dot = i; break; }
+  if (dot < 0) { out[0] = '\0'; return; }
+  int end = dot + 3;                       // integer part + '.' + 2 decimals
+  int oi = 0;
+  for (int k = 0; k < end && raw[k]; k++) out[oi++] = raw[k];
+  out[oi++] = hemi;
+  out[oi] = '\0';
+}
+
+// Build the beacon payload. With a valid GPS fix -> APRS position + BTEXT comment;
+// otherwise the plain BTEXT (status) string, preserving the old behaviour.
+void buildBeaconPayload(char *out, int outSize) {
+  if (gpsEnabled && gpsFixValid) {
+    char lat[12], lon[13];
+    aprsCoord(gpsLatRaw, gpsLatHemi, lat);
+    aprsCoord(gpsLonRaw, gpsLonHemi, lon);
+    snprintf(out, outSize, "!%s%c%s%c%s", lat, aprsSymTable, lon, aprsSymCode, beaconText);
+  } else {
+    strncpy(out, beaconText, outSize - 1);
+    out[outSize - 1] = '\0';
+  }
+}
+
 void sendBeacon(void) {
-  buildAndSendUI(beaconText, strlen(beaconText));
+  char payload[160];
+  buildBeaconPayload(payload, sizeof(payload));
+  buildAndSendUI(payload, strlen(payload));
   Serial.print("\r\n[BEACON sent] ");
-  Serial.println(beaconText);
+  Serial.println(payload);
   if (currentMode == COMMAND) Serial.print("cmd: ");
 }
 
@@ -917,6 +1001,93 @@ void cmdStatus(void) {
 }
 
 // ============================================================
+//  GPS  (NMEA 0183 decoder on a separate serial port)
+// ============================================================
+// Extract comma-separated field `idx` (0 = sentence id) into out (respects
+// empty fields; stops at the '*' checksum delimiter).
+void nmeaField(const char *s, uint8_t idx, char *out, uint8_t outSize) {
+  uint8_t f = 0, oi = 0;
+  out[0] = '\0';
+  for (const char *p = s; *p && *p != '*'; p++) {
+    if (*p == ',') { f++; if (f > idx) return; continue; }
+    if (f == idx && oi < outSize - 1) { out[oi++] = *p; out[oi] = '\0'; }
+  }
+}
+
+// Validate the NMEA "*HH" checksum (XOR of everything between '$' and '*').
+bool nmeaChecksumOK(const char *s) {
+  if (s[0] != '$') return false;
+  uint8_t sum = 0; const char *p = s + 1;
+  while (*p && *p != '*') sum ^= (uint8_t)*p++;
+  if (*p != '*') return false;
+  uint8_t given = (uint8_t)strtol(p + 1, NULL, 16);
+  return sum == given;
+}
+
+void parseNMEA(const char *s) {
+  if (!nmeaChecksumOK(s)) return;
+  const char *type = s + 3;               // skip '$' + 2-char talker (GP/GN/GL...)
+  char f[16];
+
+  if (strncmp(type, "RMC", 3) == 0) {     // Recommended Minimum -> position + validity
+    nmeaField(s, 2, f, sizeof(f));        // status A=valid V=void
+    bool valid = (f[0] == 'A');
+    if (valid) {
+      nmeaField(s, 1, gpsUtc, sizeof(gpsUtc));
+      nmeaField(s, 3, gpsLatRaw, sizeof(gpsLatRaw));
+      nmeaField(s, 4, f, sizeof(f)); gpsLatHemi = f[0] ? f[0] : 'N';
+      nmeaField(s, 5, gpsLonRaw, sizeof(gpsLonRaw));
+      nmeaField(s, 6, f, sizeof(f)); gpsLonHemi = f[0] ? f[0] : 'W';
+      gpsLastFixMs = millis();
+    }
+    gpsFixValid = valid;
+  } else if (strncmp(type, "GGA", 3) == 0) {  // fix quality, satellites, altitude
+    nmeaField(s, 6, f, sizeof(f));            // fix quality (0 = no fix)
+    if (f[0] && f[0] != '0') {
+      nmeaField(s, 7, f, sizeof(f)); gpsSats = (uint8_t)atoi(f);
+      nmeaField(s, 9, gpsAlt, sizeof(gpsAlt));
+    } else {
+      gpsSats = 0;
+    }
+  }
+}
+
+void gpsBegin(void) { gpsSerial.begin(gpsBaud); nmeaLen = 0; }
+void gpsEnd(void)   { gpsSerial.end(); gpsFixValid = false; }
+
+// Feed available GPS bytes into the line buffer (call every loop).
+void gpsService(void) {
+  if (!gpsEnabled) return;
+  while (gpsSerial.available()) {
+    char c = (char)gpsSerial.read();
+    if (c == '\r') continue;
+    if (c == '\n') { if (nmeaLen > 0) { nmea[nmeaLen] = '\0'; parseNMEA(nmea); } nmeaLen = 0; }
+    else if (nmeaLen < sizeof(nmea) - 1) nmea[nmeaLen++] = c;
+    else nmeaLen = 0;                     // overflow -> resync on next line
+  }
+}
+
+void cmdGpsStatus(void) {
+  Serial.print("GPS: "); Serial.print(gpsEnabled ? "ON" : "OFF");
+  Serial.print("   baud "); Serial.println(gpsBaud);
+  if (!gpsEnabled) return;
+  Serial.print("Fix:  "); Serial.println(gpsFixValid ? "VALID" : "no fix");
+  Serial.print("Sats: "); Serial.println(gpsSats);
+  if (gpsFixValid) {
+    Serial.print("Pos:  "); Serial.print(gpsLatRaw); Serial.print(gpsLatHemi);
+    Serial.print("  ");     Serial.print(gpsLonRaw); Serial.println(gpsLonHemi);
+    if (gpsAlt[0]) { Serial.print("Alt:  "); Serial.print(gpsAlt); Serial.println(" m"); }
+    if (gpsUtc[0]) { Serial.print("UTC:  "); Serial.println(gpsUtc); }
+    Serial.print("Age:  "); Serial.print((millis() - gpsLastFixMs) / 1000); Serial.println(" s");
+    char lat[12], lon[13];
+    aprsCoord(gpsLatRaw, gpsLatHemi, lat);
+    aprsCoord(gpsLonRaw, gpsLonHemi, lon);
+    Serial.print("APRS: !"); Serial.print(lat); Serial.print(aprsSymTable);
+    Serial.print(lon); Serial.println(aprsSymCode);
+  }
+}
+
+// ============================================================
 //  RX: HDLC parser (called once per decoded data bit)
 // ============================================================
 static inline void hdlcParse(uint8_t bit) {
@@ -1087,6 +1258,7 @@ void setup() {
 void loop() {
   updateLED();
   ax25Service();
+  gpsService();
 
   // Verified frame from the modem -> host (KISS) or link layer (terminal)
   if (rxFrameReady) {
@@ -1286,6 +1458,30 @@ void loop() {
           if (v > PACLEN_MAX) v = PACLEN_MAX;
           paclen = (uint8_t)v;
           Serial.print("PACLEN = "); Serial.println(paclen);
+        } else if (cmd == "GPS ON") {
+          gpsEnabled = true; gpsBegin(); Serial.println("GPS ON.");
+        } else if (cmd == "GPS OFF") {
+          gpsEnabled = false; gpsEnd(); Serial.println("GPS OFF.");
+        } else if (cmd.startsWith("GPS BAUD ")) {
+          long b = cmd.substring(9).toInt();
+          if (b >= 1200 && b <= 115200) {
+            gpsBaud = (uint32_t)b;
+            if (gpsEnabled) { gpsEnd(); gpsBegin(); }
+            Serial.print("GPS baud "); Serial.println(gpsBaud);
+          } else Serial.println("Baud out of range (1200-115200).");
+        } else if (cmd == "GPS" || cmd == "GPS STATUS") {
+          cmdGpsStatus();
+        } else if (cmd == "SYMBOL") {
+          Serial.print("Symbol: "); Serial.print(aprsSymTable); Serial.println(aprsSymCode);
+        } else if (cmd.startsWith("SYMBOL ")) {
+          String s = raw.substring(7); s.trim();      // original case (codes are case-sensitive)
+          if (s.length() >= 2) {
+            aprsSymTable = s.charAt(0);
+            aprsSymCode  = s.charAt(1);
+            Serial.print("Symbol set: "); Serial.print(aprsSymTable); Serial.println(aprsSymCode);
+          } else {
+            Serial.println("Usage: SYMBOL <table><code>   e.g. SYMBOL /-  (house), /> (car)");
+          }
         } else if (cmd == "CONV") {
           currentMode = CONVERSE;
           Serial.println("Entering Converse Mode (Ctrl+C to exit)");
@@ -1305,6 +1501,10 @@ void loop() {
           Serial.println("  FRACK [sec]        - Retransmit timeout (T1)");
           Serial.println("  RETRY [n]          - Max retries (N2) before link fails");
           Serial.println("  PACLEN [n]         - Max info bytes per I-frame (1-255)");
+          Serial.println("  GPS ON | OFF       - Enable/disable GPS position source");
+          Serial.println("  GPS BAUD <n>       - GPS serial speed (default 9600)");
+          Serial.println("  GPS                - Show GPS status and current location");
+          Serial.println("  SYMBOL <tbl><code> - APRS symbol, e.g. /- house, /> car");
           Serial.println("  MHEARD             - List stations heard (alias: MH)");
           Serial.println("  MONITOR ON | OFF   - Show/hide heard UI frames");
           Serial.println("  BTEXT <text>       - Set beacon text");
