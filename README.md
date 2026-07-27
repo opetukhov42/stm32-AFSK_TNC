@@ -26,7 +26,8 @@ and the ADC for receive audio.
   insertion and a 30 s duplicate-suppression cache
 - **MHEARD** list and a **monitor** toggle
 - **Status LED** — steady = idle, fast blink = traffic, slow blink = connected
-- **GPS position source** — NMEA decoder on a separate serial port; beacons transmit live coordinates
+- **GPS position source** — NMEA decoder on a separate serial port; beacons transmit live coordinates. Includes toggle for hardware or software serial.
+- **Weather Station Telemetry** — Manual CLI input or automatic serial parsing for APRS weather beacons using standard telemetry formats (e.g., `270/010g015t072...`).
 - **Live-tunable** link parameters (`FRACK`, `RETRY`, `PACLEN`)
 
 ---
@@ -51,6 +52,7 @@ and the ADC for receive audio.
 | 1 | Resistor | 1 kΩ | PTT base |
 | 1 | Resistor | 10 kΩ | PTT base pull-down (optional) |
 | 1 | GPS module | NMEA @ 3.3 V logic (u-blox NEO-6M/7M/8M etc.) | Position source (optional) |
+| 1 | Weather sensor | Serial weather instrument | Weather source (optional) |
 
 You'll also need a cable/connector appropriate to your radio (HT 2.5/3.5 mm jacks, or a
 mobile's 6-pin mini-DIN "DATA" port). The onboard **PC13 LED** is used for status, so no
@@ -62,10 +64,12 @@ external LED is required.
 |--------|-----------|-----------|-------|
 | RX audio in | **PA0** | analog in (ADC) | AC-coupled, biased to 1.65 V |
 | TX audio out | **PA1** | PWM out | ~281 kHz PWM, RC-filtered to audio |
-| PTT | **PA2** | digital out | drives NPN, HIGH = keyed |
+| PTT | **PA4** | digital out | drives NPN, HIGH = keyed |
 | Status LED | **PC13** | digital out | onboard LED (active LOW) |
-| GPS in | **PB11** | serial RX | from GPS TX (optional) |
-| GPS out | **PB10** | serial TX | to GPS RX, usually unused (optional) |
+| GPS in | **PB11** | serial RX | from GPS TX (USART3 or SoftSerial) |
+| GPS out | **PB10** | serial TX | to GPS RX (USART3 or SoftSerial) |
+| Weather in | **PA3** | serial RX | from WX TX (USART2 or SoftSerial) |
+| Weather out | **PA2** | serial TX | to WX RX (USART2 or SoftSerial) |
 | Console | USB (CDC) | serial | 115200 baud, 8N1 |
 
 ---
@@ -77,57 +81,47 @@ All three share a **common ground** with the radio. Keep leads short.
 
 ### Full wiring diagram
 
-```
-                         STM32F103C8T6 (Blue Pill)
-                        ┌───────────────────────────┐
-                        │                           │
-   RADIO AF/SPKR OUT    │                           │
-        ────────┐       │                           │
-                │       │                           │
-        ┌───[ 10k trimmer ]───┐  (RX level)         │
-        │                     │                     │
-       GND                  wiper                    │
-                              │                      │
-                              │   100nF              │
-                              ├────┤├──────┬─────────┤ PA0  (RX audio, ADC)
-                              │           │          │
-                   3.3V ─[10k]┴[10k]─ GND │          │      bias tap = 1.65 V
-                              (bias)      │          │
-                                     [10nF] (opt.)   │
-                                          │          │
-                                         GND         │
-                                                     │
-                                                     │
-                      TX LOW-PASS FILTER             │
-        RADIO MIC / DATA-IN                          │
-             ▲                                       │
-             │      100nF/1uF                        │
-       [ 10k trimmer ]                               │
-             ▲   (TX level / deviation)              │
-             │                                       │
-             ├──┤├──┬──[4.7k]──┬──[4.7k]──┬──────────┤ PA1  (TX audio, PWM)
-             │      │          │          │          │
-            GND   [10nF]     [10nF]      (from PA1)   │
-                    │          │                      │
-                   GND        GND                     │
-                                                     │
-                      PTT SWITCH                      │
-        RADIO PTT line                                │
-             │                                        │
-             ├───────────── C (collector)             │
-             │             ╱                          │
-          (2N3904)  B ──[1k]──────────────────────────┤ PA2  (PTT, HIGH = key)
-             │             ╲                          │
-             │              E (emitter)               │
-        ─────┴──────┬───────┘                         │
-                   GND ─── [10k] ─── B  (optional)    │
-                        │                             │
-   RADIO GND ───────────┴─── COMMON GND ──────────────┤ GND
-                                                     │
-                        └───────────────────────────┘
-
-        Blue Pill powered from USB (or 5V/3.3V). Radio powered separately.
-        The COMMON GND tie between radio and Blue Pill is essential.
+```text
+                               STM32F103C8T6 (Blue Pill)
+                              ┌─────────────────────────┐
+[RADIO AF/SPKR OUT]           │                         │
+       │                      │                         │
+ ┌─────┴─────┐                │                         │
+GND 10k Pot  │(RX level)      │                         │
+ └─────┬─────┘                │                         │
+     wiper   100nF            │                         │
+       ├──────┤├──────────────┼─────────────────────────┤ PA0 (RX audio, ADC)
+       │                      │                         │
+3.3V─[10k]─┬─[10k]─GND        │                         │
+           │                  │                         │
+         [10nF] (optional)    │                         │
+           │                  │                         │
+          GND                 │                         │
+                              │                         │
+[RADIO MIC / DATA-IN]         │                         │
+       │                      │                         │
+ ┌─────┴─────┐                │                         │
+GND 10k Pot  │(TX level)      │                         │
+ └─────┬─────┘                │                         │
+       │     100nF/1uF        │                         │
+       ├────────┤├───────┬────┴──[4.7k]───┬───[4.7k]────┤ PA1 (TX audio, PWM)
+       │                 │                │             │
+      GND              [10nF]           [10nF]          │
+                         │                │             │
+                        GND              GND            │
+                                                        │
+[RADIO PTT LINE]              │                         │
+       │                      │                         │
+       ├───────── C           │                         │
+       │ (2N3904)  ╲          │                         │
+       │            B ────────┼───[ 1k ]────────────────┤ PA4 (PTT, HIGH=key)
+       │           ╱ │        │                         │
+       └───────── E  │        │                         │
+                 │   └─[10k]──┼─ GND (opt. pull-down)   │
+                 │            │                         │
+[RADIO GND] ─────┴────────────┼─────────────────────────┤ GND
+                              │                         │
+                              └─────────────────────────┘
 ```
 
 ### 1. Receive audio → PA0
@@ -144,11 +138,6 @@ Radio receive audio is **AC-coupled** and **biased to half the supply (1.65 V)**
   PA0. Too much clips the ADC and kills decoding; too little buries the signal in noise.
 - The optional **10 nF** cap from PA0 to GND is a light anti-alias/noise filter.
 
-**Where to take the audio:** a fixed-level **"data out" / discriminator** pin (on a
-mobile's data port) is ideal because its level doesn't change with the volume knob. If you
-use the **speaker/headphone jack**, set a moderate volume and leave it there — and re-tune
-the RX trimmer if you change it.
-
 ### 2. Transmit audio → radio mic
 
 PA1 emits a ~281 kHz PWM whose duty cycle traces the audio waveform. An **RC low-pass
@@ -160,54 +149,26 @@ filter** reconstructs the 1200/2200 Hz tones and removes the PWM carrier.
 - A **10 kΩ trimmer** attenuates it down to microphone level (typically only tens of
   millivolts). This trimmer is your **deviation control** — see *Calibration* below.
 
-**Mobile data ports** often have a dedicated audio input expecting near line level; check
-your radio manual, as you may need less attenuation there than on a mic jack.
-
 ### 3. PTT → radio
 
 A small **NPN transistor** keys the radio by pulling its PTT line to ground (how most
 radios and data ports key).
 
-- **PA2 → 1 kΩ → base.** Emitter to GND. Collector to the radio's PTT line.
-- When PA2 goes HIGH the transistor saturates and grounds PTT.
+- **PA4 → 1 kΩ → base.** Emitter to GND. Collector to the radio's PTT line.
+- When PA4 goes HIGH the transistor saturates and grounds PTT.
 - The optional **10 kΩ** base-to-emitter resistor ensures a clean turn-off.
-- On many HTs, PTT is keyed by a resistor to ground **on the mic line** rather than a
-  separate pin — consult your radio's data-cable pinout and adapt accordingly.
 
-### Grounding & isolation
+### 4. GPS & Weather Station (optional)
 
-Use one solid common ground and short leads. For a permanent or high-RF-environment
-install, consider **audio isolation transformers** (600:600 Ω) on the TX and RX audio and
-an **optocoupler** on PTT to break ground loops (hum) and keep RF out of the MCU. This is
-optional for bench testing.
+Both the GPS and Weather Station interfaces can be toggled in the firmware between hardware UART and SoftwareSerial using the `#define GPS_USE_SOFTWARE_SERIAL` and `#define WX_USE_SOFTWARE_SERIAL` flags at the top of the sketch.
 
-### 4. GPS (optional)
+- **GPS:** Uses **PB11** (RX) and **PB10** (TX). Default NMEA rate is 9600 baud (`GPS BAUD` to change).
+- **Weather:** Uses **PA3** (RX) and **PA2** (TX).
 
-Wire a serial NMEA GPS module for automatic position beacons:
-
-| GPS module | STM32 |
-|------------|-------|
-| TX | **PB11** (GPS in) |
-| RX | PB10 (optional — only if you configure the GPS from the TNC) |
-| VCC | 3.3 V |
-| GND | common GND |
-
-Use a **3.3 V-logic** GPS (u-blox NEO-6M/7M/8M breakouts are ideal — most run happily on
-3.3 V). Enable it with `GPS ON`; the default NMEA rate is 9600 baud (`GPS BAUD` to change).
-
-> **Serial port — choose one (flag at the top of the sketch):**
->
-> - **`GPS_USE_SOFTWARE_SERIAL 1` :** bit-banged `SoftwareSerial` on PB11/PB10.
->   Compiles on any board configuration. Because the modem runs a continuous 9600 Hz
->   interrupt, some NMEA sentences may be dropped — bad ones fail the checksum and are
->   discarded, so you still get a fix, just a little slower. Fine for beaconing.
-> - **`GPS_USE_SOFTWARE_SERIAL 0` (default):** hardware USART3 via the core's `Serial3` (no dropped
->   bytes). Two requirements:
->   1. **Tools → "U(S)ART support: Enabled (generic 'Serial')"** (not "Disabled"). If it's
->      Disabled the core omits its `HardwareSerial` class and you get
->      `cannot declare ... abstract type 'HardwareSerial'`.
->
->   The USB-CDC console stays on `Serial`; the GPS uses USART3 (PB11 RX / PB10 TX).
+> **Hardware Serial Requirements:**
+> If you set the toggle to `0` to use hardware serial, you must configure the core correctly:
+> 1. **Tools → "U(S)ART support: Enabled (generic 'Serial')"** (not "Disabled"). If it's
+>    Disabled the core omits its `HardwareSerial` class and the linker will fail.
 
 ---
 
@@ -218,21 +179,19 @@ This firmware targets the **official STMicroelectronics Arduino core**.
 1. **Install the STM32 core** in the Arduino IDE. Add this Boards Manager URL
    (*File → Preferences*):
    ```
-   https://github.com/stm32duino/BoardManagerFiles/raw/main/package_stmicroelectronics_index.json
+   [https://github.com/stm32duino/BoardManagerFiles/raw/main/package_stmicroelectronics_index.json](https://github.com/stm32duino/BoardManagerFiles/raw/main/package_stmicroelectronics_index.json)
    ```
    then install **"STM32 MCU based boards"** in *Tools → Board → Boards Manager*.
 
 2. **Board settings** (*Tools* menu):
    - Board: **Generic STM32F1 series**
    - Board part number: **BluePill F103C8** (or **F103C8 (128K)** if your chip has 128 KB)
-   - U(S)ART support: **Enabled (generic 'Serial')** (any "Enabled" option works with the
-     default SoftwareSerial GPS; hardware-serial GPS specifically needs an "Enabled" one —
-     see the GPS section)
+   - U(S)ART support: **Enabled (generic 'Serial')**
    - USB support: **CDC (generic Serial supersede U(S)ART)** — needed for the console over USB
    - Upload method: **STM32CubeProgrammer (SWD)** with an ST-Link (recommended)
 
 3. **Flash** `stm32-AFSK_TNC.ino` with an **ST-Link V2** on the SWD header (3V3, GND,
-   SWDIO, SWCLK). Serial-bootloader (BOOT0) or DFU upload also work if you prefer.
+   SWDIO, SWCLK).
 
 4. **Open the Serial Monitor** at **115200 baud** and you should see the `cmd:` prompt.
 
@@ -266,6 +225,10 @@ There are three modes:
 | `GPS BAUD <n>` | | GPS serial speed, 1200–115200 (default 9600) |
 | `GPS` | | Show GPS status and current location |
 | `SYMBOL <table><code>` | | APRS symbol, e.g. `SYMBOL /-` (house), `SYMBOL />` (car) |
+| `WX OFF` | | Disable weather station telemetry |
+| `WX MANUAL` | | Enable manual weather data entry via `WX SET` |
+| `WX SERIAL` | | Enable weather data parsing from serial RX pin |
+| `WX SET <data>` | | Set manual telemetry (e.g. `270/010g015t072...`) |
 | `MHEARD` | `MH` | List recently heard stations |
 | `MONITOR ON` / `MONITOR OFF` | | Show/hide heard UI frames |
 | `BTEXT <text>` | | Set beacon payload text |
@@ -279,29 +242,16 @@ There are three modes:
 | `KISS ON` | | Enter KISS mode |
 | `HELP` | | Command list |
 
-Typing `FRACK`, `RETRY`, or `PACLEN` with no argument prints the current value.
-Settings live in RAM and reset to defaults on reboot.
-
-### Example: a connected-mode QSO
-
+### Example: Weather Station setup
+You can input weather telemetry directly into the beacon payload via the terminal, or stream it automatically using serial.
+```text
+cmd: WX MANUAL
+Weather mode: MANUAL.
+cmd: WX SET 270/010g015t072r000p000P000h50b10150
+Weather data set to: 270/010g015t072r000p000P000h50b10150
+cmd: BEACON
 ```
-cmd: MYCALL N0CALL
-MYCALL updated to: N0CALL
-cmd: CONNECT W1ABC
-*** Connecting to W1ABC ...
-*** CONNECTED to W1ABC
-(connected - type to send, Ctrl+C for command mode)
-Hello, this goes out as an I-frame.
-...replies from W1ABC appear here...
-<Ctrl-C>
-cmd: DISCONNECT
-*** Disconnecting ...
-*** DISCONNECTED
-```
-
-To connect *through* digipeaters, set `PATH WIDE1-1` (or the specific digi calls) before
-`CONNECT`. When another station connects to **you**, the TNC automatically replies using
-the reverse of their path.
+*If a GPS fix is acquired, the weather payload will automatically append to the coordinates using the `_` symbol identifier.*
 
 ### Example: APRS beacon
 
@@ -312,42 +262,6 @@ cmd: BTEXT !4903.50N/07201.75W-STM32 TNC
 cmd: BEACON EVERY 600
 Auto-beacon every 600s.
 ```
-
-With a **GPS** attached, let it supply the position instead — `BTEXT` becomes just the
-comment and the coordinates are inserted live from each fix:
-
-```
-cmd: GPS ON
-GPS ON.
-cmd: BTEXT STM32 mobile
-cmd: GPS
-GPS: ON   baud 9600
-Fix:  VALID
-Sats: 8
-Pos:  4903.500N  07201.750W
-APRS: !4903.50N/07201.75W>
-cmd: BEACON EVERY 120
-```
-When GPS is on with a valid fix, beacons send `!<lat>/<lon>>` + your `BTEXT` comment;
-with no fix (or GPS off) they fall back to sending `BTEXT` as plain text.
-
-### Example: fill-in digipeater
-
-```
-cmd: MYCALL N0CALL
-cmd: DIGI ON
-cmd: DIGI FILL        (home fill-in: repeats WIDE1-1 only)
-```
-For a wide-area digi use `DIGI WIDE` and set `WIDEMAX` to a sane local value (2 is plenty
-almost everywhere). Please understand your local digi plan before running a wide digi.
-
-### KISS mode with host software
-
-`KISS ON`, then point your application at the serial port at **115200 baud**. Verified
-conceptually against the standard KISS framing used by Dire Wolf, APRSISCE/32, Xastir,
-UI-View, YAAC, and similar. In KISS mode the TNC passes raw frames both ways and leaves
-beaconing/digipeating/connected-mode to the host. Send a KISS "Return" (or reset the board)
-to leave KISS mode.
 
 ### Status LED (PC13)
 
@@ -388,26 +302,6 @@ on the air.
 - **Link layer:** a mod-8 AX.25 v2.2 state machine handles the connected-mode session.
 
 ---
-
-## Limitations
-
-- One connected session at a time; **mod-8 only** (no SABME / mod-128).
-- Connected mode runs in the terminal (not in KISS — the host owns L2 there).
-- Configuration is **not persisted** across reboots (lives in RAM).
-- The digipeater is call/alias + WIDEn-N; it does **not** implement `SSn-N`, `TRACEn-N`,
-  or preemptive digipeating.
-- RX performance depends on your analog front end and levels. For lowest jitter, the ADC can
-  be driven directly from the timer (read `ADC1->DR`) instead of `analogRead()` — see the
-  note in `sampleISR()`.
-
----
-
-## Credits
-
-- The AFSK demodulator (delay-line discriminator + digital PLL) is based on the well-known
-  design from **MicroModem** by Mark Qvist and the **BeRTOS** AFSK modem.
-- Framing and link layer follow the **AX.25 v2.2** specification (TAPR/ARRL).
-- Digipeating follows the APRS **New N-Paradigm**.
 
 ## License
 

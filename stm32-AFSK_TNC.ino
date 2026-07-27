@@ -10,29 +10,18 @@
  *     Boards Manager URL:
  *       https://github.com/stm32duino/BoardManagerFiles/raw/main/package_stmicroelectronics_index.json
  *     Board:  "Generic STM32F1 series" -> "BluePill F103C8" (or C8T6)
- *     USB support: "CDC (generic Serial supersede U(S)ART)" if you want
- *                  Serial over the native USB port; otherwise use USART1.
+ *     USB support: "CDC (generic Serial supersede U(S)ART)"
+ *     U(S)ART support: "Enabled (generic 'Serial')"
  *
  * HARDWARE (STM32F103C8T6)
- *   RX Audio -> PA0 (ADC).  AC-couple the radio's speaker/discriminator
- *               audio through ~0.1uF and bias PA0 to 1.65V with a
- *               2x10k divider from 3V3 to GND. Keep peak-to-peak well
- *               under 3.3V (a series pot helps).
- *   TX Audio -> PA1 (PWM). RC low-pass to the radio mic:
- *               PA1 --[ 4.7k ]--+--> mic, and 10nF from that node to GND
- *               (fc ~= 3.4 kHz). Add a series cap + trimmer to set level.
- *   PTT      -> PA2 -> NPN base (1k), collector pulls the radio PTT to GND.
- *   Status   -> PC13 onboard LED (active LOW). Steady = OK/idle;
- *               100 ms blink = serial/on-air activity; 500 ms blink = connected.
- *
- * NOTES ON RELIABILITY
- *   The demodulator is the classic MicroModem/BeRTOS delay-multiply +
- *   digital-PLL design and decodes real on-air 1200 packets, but AFSK RX
- *   is analog-sensitive: audio level, DC bias and the RC filter all matter.
- *   For this baseline the ADC is read with analogRead() inside the sample
- *   ISR for portability. If decode is marginal, the single biggest upgrade
- *   is to trigger the ADC directly from the timer and read ADC1->DR (removes
- *   sampling jitter). See the comment in sampleISR().
+ *   RX Audio (AFSK) -> PA0 (ADC_IN0). AC-couple the radio's speaker/discriminator audio.
+ *   TX Audio (AFSK) -> PA1 (TIM2_CH2). RC low-pass to the radio mic.
+ *   PTT Control     -> PA4. Drives an NPN transistor base to pull radio PTT to GND.
+ *   Status LED      -> PC13. Onboard LED (active LOW).
+ *   GPS RX (Data)   -> PB11 (USART3_RX). Connect to the GPS module's TX pin.
+ *   GPS TX (Data)   -> PB10 (USART3_TX). Connect to the GPS module's RX pin (optional).
+ *   Weather RX      -> PA3 (USART2_RX). Connect to the Weather Station's TX pin.
+ *   Weather TX      -> PA2 (USART2_TX). Connect to the Weather Station's RX pin (optional).
  */
 
 #include <Arduino.h>
@@ -40,47 +29,34 @@
 #include <math.h>
 
 // ---------------- GPS serial port ----------------
-// Two ways to talk to the GPS; pick with the flag below.
-//
-//   GPS_USE_SOFTWARE_SERIAL 1  (default): bit-banged SoftwareSerial on PB11/PB10.
-//     Compiles on any board configuration. The modem's continuous 9600 Hz ISR
-//     competes with its bit timing, so some NMEA sentences may be dropped - bad
-//     ones fail the checksum and are discarded, so you still get a fix, just a
-//     little slower. Perfectly usable for beaconing.
-//
-//   GPS_USE_SOFTWARE_SERIAL 0: hardware USART3 via the core's Serial3 instance.
-//     On this core you CANNOT declare your own HardwareSerial object (the Arduino.h
-//     chain only exposes the abstract base class), so we use the predefined Serial3.
-//     TWO things are required, both external to this file:
-//       1) Tools > "U(S)ART support" = "Enabled (generic 'Serial')" (not "Disabled").
-//       2) A file named  build_opt.h  MUST sit in this sketch's folder containing:
-//              -DENABLE_HWSERIAL3 -DPIN_SERIAL3_RX=PB11 -DPIN_SERIAL3_TX=PB10
-//          That is what actually creates the Serial3 object on USART3. Without it
-//          you get "undefined reference to `Serial3'" at link time.
-//     Your USB-CDC console stays on `Serial`. USART3 pins: PB10 = TX, PB11 = RX.
 #define GPS_USE_SOFTWARE_SERIAL 0
 #define GPS_RX_PIN PB11   // GPS TX -> here (USART3 RX)
-#define GPS_TX_PIN PB10   // GPS RX <- here (USART3 TX, usually unused)
+#define GPS_TX_PIN PB10   // GPS RX <- here (USART3 TX)
 #if GPS_USE_SOFTWARE_SERIAL
   #include <SoftwareSerial.h>
   SoftwareSerial gpsSerial(GPS_RX_PIN, GPS_TX_PIN);
 #else
-  // The core expects Serial3 to exist but failed to compile it.
-  // We manually define it here using the correct 'Uart' class to satisfy the linker!
+  // Explicitly instantiate Serial3 to satisfy the core's linker requirements
   Uart Serial3(GPS_RX_PIN, GPS_TX_PIN);
-  // Map our gpsSerial reference to this newly created Serial3 object
   #define gpsSerial Serial3
 #endif
 
+// ---------------- Weather Station serial port ----
+// Explicitly instantiate Serial2 on PA3 (RX) and PA2 (TX)
+Uart Serial2(PA3, PA2);
+
+enum WxMode { WX_OFF, WX_MANUAL, WX_SERIAL2 };
+WxMode wxMode = WX_OFF;
+char wxData[80] = "000/000g000t000r000p000P000h00b00000"; // Dummy template
+char wxSerialBuf[80];
+uint8_t wxSerialLen = 0;
+
 // APRS symbol for GPS position beacons (runtime-settable via the SYMBOL command).
-// Table id: '/' primary, '\' alternate, or an overlay char (0-9 / A-Z).
-// Code examples: '>' car, '-' house, 'b' bicycle, '[' jogger, 'k' truck, '_' wx.
-// Symbol codes are CASE-SENSITIVE.
 char aprsSymTable = '/';
 char aprsSymCode  = '>';
 
 // ---------------- Pin map ----------------
-#define PTT_PIN PA2
+#define PTT_PIN PA4   // Moved to PA4 to free up PA2 for USART2 TX
 #define TX_PIN  PA1   // TIM2_CH2
 #define RX_PIN  PA0   // ADC_IN0
 #define LED_PIN         PC13  // Blue Pill onboard LED (active LOW)
@@ -244,9 +220,6 @@ void ledWrite(bool on) {
 void noteActivity(void) { lastActivityMs = millis(); }
 
 // Non-blocking LED state machine (call every loop):
-//   CONNECTED       -> blink 500 ms   (highest priority)
-//   recent activity -> blink 100 ms   (serial or on-air)
-//   otherwise (OK)  -> steady ON
 void updateLED(void) {
   uint32_t now = millis();
   uint16_t period;
@@ -264,7 +237,7 @@ void updateLED(void) {
 }
 
 // ============================================================
-//  CRC-16 / X.25 (AX.25 FCS)  poly 0x8408 (reflected), init 0xFFFF
+//  CRC-16 / X.25 (AX.25 FCS)
 // ============================================================
 static uint16_t crcUpdate(uint16_t crc, uint8_t b) {
   crc ^= b;
@@ -279,7 +252,7 @@ static bool checkFCS(uint8_t *buf, uint16_t len) {
   if (len < 2) return false;
   uint16_t crc = 0xFFFF;
   for (uint16_t i = 0; i < len - 2; i++) crc = crcUpdate(crc, buf[i]);
-  crc ^= 0xFFFF;                                   // ones-complement
+  crc ^= 0xFFFF;
   return ((uint8_t)(crc & 0xFF) == buf[len - 2]) &&
          ((uint8_t)(crc >> 8)  == buf[len - 1]);
 }
@@ -288,7 +261,7 @@ static bool checkFCS(uint8_t *buf, uint16_t len) {
 //  TX: build the HDLC bitstream (flags + stuffed data + FCS)
 // ============================================================
 static inline void txPushBitRaw(uint8_t bit) {
-  if ((txBitCount >> 3) >= TX_BITBUF_BYTES) return;  // overflow guard
+  if ((txBitCount >> 3) >= TX_BITBUF_BYTES) return;
   uint32_t idx = txBitCount >> 3;
   uint8_t  msk = 1 << (txBitCount & 7);
   if (bit) txBitBuf[idx] |=  msk;
@@ -296,7 +269,7 @@ static inline void txPushBitRaw(uint8_t bit) {
   txBitCount++;
 }
 
-static inline void txPushDataBit(uint8_t bit) {   // with bit-stuffing
+static inline void txPushDataBit(uint8_t bit) {
   txPushBitRaw(bit);
   if (bit) {
     if (++txStuffOnes == 5) { txPushBitRaw(0); txStuffOnes = 0; }
@@ -305,38 +278,33 @@ static inline void txPushDataBit(uint8_t bit) {   // with bit-stuffing
   }
 }
 
-static void txPushByte(uint8_t b) {               // LSB first, stuffed
+static void txPushByte(uint8_t b) {
   for (uint8_t i = 0; i < 8; i++) txPushDataBit((b >> i) & 1);
 }
 
-static void txPushFlag(void) {                    // 0x7E, NOT stuffed
+static void txPushFlag(void) {
   txStuffOnes = 0;
   txPushBitRaw(0);
   for (uint8_t i = 0; i < 6; i++) txPushBitRaw(1);
   txPushBitRaw(0);
 }
 
-// PTT control (radio needs time to key up / PLL lock)
 void triggerPTT(bool state) {
   digitalWrite(PTT_PIN, state ? HIGH : LOW);
-  if (state) delay(250);   // TX delay: let the transmitter come up
-  else       delay(50);    // TX tail
+  if (state) delay(250);
+  else       delay(50);
 }
 
-// Take a raw AX.25 frame (address..info, NO FCS), append FCS,
-// HDLC-encode and key the transmitter.
 void sendAX25Frame(uint8_t *data, uint16_t len) {
   if (len == 0 || len > (MAX_FRAME - 2)) return;
-  noteActivity();                    // on-air TX activity
+  noteActivity();
 
-  // 1) FCS over the frame data
   uint16_t crc = 0xFFFF;
   for (uint16_t i = 0; i < len; i++) crc = crcUpdate(crc, data[i]);
   crc ^= 0xFFFF;
   uint8_t fcsLo = crc & 0xFF;
   uint8_t fcsHi = (crc >> 8) & 0xFF;
 
-  // 2) Build the bitstream
   txBitCount = 0;
   txStuffOnes = 0;
   for (uint16_t i = 0; i < TX_PREAMBLE_FLAGS; i++) txPushFlag();
@@ -345,7 +313,6 @@ void sendAX25Frame(uint8_t *data, uint16_t len) {
   txPushByte(fcsHi);
   for (uint16_t i = 0; i < TX_TAIL_FLAGS; i++)     txPushFlag();
 
-  // 3) Fire the DDS via the sample ISR
   txBitIndex = 0;
   txSampleInBit = 0;
   txPhase = 0;
@@ -354,25 +321,21 @@ void sendAX25Frame(uint8_t *data, uint16_t len) {
   txDone = false;
 
   triggerPTT(true);
-  transmitting = true;               // ISR now generates tones
-  while (!txDone) { /* wait for the whole frame to clock out */ }
+  transmitting = true;
+  while (!txDone) { /* wait */ }
   transmitting = false;
 
-  PwmTimer->setCaptureCompare(2, PWM_TOP / 2, TICK_COMPARE_FORMAT); // silence
+  PwmTimer->setCaptureCompare(2, PWM_TOP / 2, TICK_COMPARE_FORMAT);
   triggerPTT(false);
 }
 
-// Encode one AX.25 address (callsign + SSID). Sets the extension bit on the
-// final address of the field and leaves the H ("has-been-repeated") bit clear.
 void encodeAddress(const char *call, uint8_t ssid, uint8_t *out, bool isLast) {
   uint8_t n = strlen(call);
-  for (uint8_t i = 0; i < 6; i++)
-    out[i] = ((i < n) ? call[i] : ' ') << 1;
-  out[6] = ((ssid & 0x0F) << 1) | 0x60;        // reserved bits set
-  if (isLast) out[6] |= 0x01;                  // extension bit -> last address
+  for (uint8_t i = 0; i < 6; i++) out[i] = ((i < n) ? call[i] : ' ') << 1;
+  out[6] = ((ssid & 0x0F) << 1) | 0x60;
+  if (isLast) out[6] |= 0x01;
 }
 
-// Build a UI frame (dest, source, optional TX path, ctrl, PID, payload) and TX.
 void buildAndSendUI(const char *payload, uint16_t len) {
   uint8_t frame[MAX_FRAME];
   uint16_t p = 0;
@@ -382,43 +345,48 @@ void buildAndSendUI(const char *payload, uint16_t len) {
     encodeAddress(txPathCalls[i], txPathSSID[i], &frame[p], i == txPathCount - 1);
     p += 7;
   }
-  frame[p++] = 0x03;   // UI control
-  frame[p++] = 0xF0;   // PID: no layer-3
+  frame[p++] = 0x03;
+  frame[p++] = 0xF0;
   for (uint16_t i = 0; i < len && p < MAX_FRAME - 2; i++) frame[p++] = payload[i];
   sendAX25Frame(frame, p);
 }
 
-// Convenience: transmit typed text as a UI frame (converse mode)
 void transmitTextPacket(char *payload, uint8_t len) {
   buildAndSendUI(payload, len);
   Serial.println("\r\n[TX OK]");
 }
 
-// Send the configured beacon once
-// Convert an NMEA coordinate (ddmm.mmmm / dddmm.mmmm) + hemisphere into the
-// APRS fixed-width form ddmm.mmN / dddmm.mmW (2 decimal minutes).
 void aprsCoord(const char *raw, char hemi, char *out) {
   int dot = -1;
   for (int i = 0; raw[i]; i++) if (raw[i] == '.') { dot = i; break; }
   if (dot < 0) { out[0] = '\0'; return; }
-  int end = dot + 3;                       // integer part + '.' + 2 decimals
+  int end = dot + 3;
   int oi = 0;
   for (int k = 0; k < end && raw[k]; k++) out[oi++] = raw[k];
   out[oi++] = hemi;
   out[oi] = '\0';
 }
 
-// Build the beacon payload. With a valid GPS fix -> APRS position + BTEXT comment;
-// otherwise the plain BTEXT (status) string, preserving the old behaviour.
 void buildBeaconPayload(char *out, int outSize) {
   if (gpsEnabled && gpsFixValid) {
     char lat[12], lon[13];
     aprsCoord(gpsLatRaw, gpsLatHemi, lat);
     aprsCoord(gpsLonRaw, gpsLonHemi, lon);
-    snprintf(out, outSize, "!%s%c%s%c%s", lat, aprsSymTable, lon, aprsSymCode, beaconText);
+    
+    if (wxMode != WX_OFF) {
+      // APRS WX format uses '_' as the symbol code, followed by the WX data
+      snprintf(out, outSize, "!%s%c%s_%s%s", lat, aprsSymTable, lon, wxData, beaconText);
+    } else {
+      snprintf(out, outSize, "!%s%c%s%c%s", lat, aprsSymTable, lon, aprsSymCode, beaconText);
+    }
   } else {
-    strncpy(out, beaconText, outSize - 1);
-    out[outSize - 1] = '\0';
+    if (wxMode != WX_OFF) {
+      // No GPS, but WX active
+      snprintf(out, outSize, "%s%s", wxData, beaconText);
+    } else {
+      strncpy(out, beaconText, outSize - 1);
+      out[outSize - 1] = '\0';
+    }
   }
 }
 
@@ -432,7 +400,6 @@ void sendBeacon(void) {
 }
 
 // ---- Digipeater ------------------------------------------------------------
-// Does a 7-byte AX.25 address equal call+ssid?
 bool addrMatches(const uint8_t *addr, const char *call, uint8_t ssid) {
   uint8_t n = strlen(call);
   for (uint8_t i = 0; i < 6; i++) {
@@ -443,29 +410,24 @@ bool addrMatches(const uint8_t *addr, const char *call, uint8_t ssid) {
   return (((addr[6] >> 1) & 0x0F) == (ssid & 0x0F));
 }
 
-// Insert a 7-byte address at byte offset `off`, shifting the rest right.
-// Returns false if there is no room. `hbit` sets the has-been-repeated flag.
-bool insertAddress(uint8_t *frame, uint16_t *len, uint16_t off,
-                   const char *call, uint8_t ssid, bool hbit) {
+bool insertAddress(uint8_t *frame, uint16_t *len, uint16_t off, const char *call, uint8_t ssid, bool hbit) {
   if (*len + 7 > (MAX_FRAME - 2)) return false;
   memmove(frame + off + 7, frame + off, *len - off);
-  encodeAddress(call, ssid, &frame[off], false);   // inserted addr is never last
+  encodeAddress(call, ssid, &frame[off], false);
   if (hbit) frame[off + 6] |= 0x80;
   *len += 7;
   return true;
 }
 
-// Content signature for duplicate detection: dest + source + info, ignoring the
-// via path and the C/H bits, so an original and all of its repeats hash alike.
 uint16_t packetSignature(uint8_t *frame, uint16_t len) {
   uint16_t i = 0; bool end = false;
   while (i + 7 <= len) { if (frame[i + 6] & 0x01) { end = true; break; } i += 7; }
   if (!end) return 0;
   uint16_t infoStart = i + 7;
   uint16_t crc = 0xFFFF;
-  for (uint8_t k = 0;  k < 6;  k++)  crc = crcUpdate(crc, frame[k]);     // dest call
-  for (uint8_t k = 7;  k < 13; k++)  crc = crcUpdate(crc, frame[k]);     // src call
-  crc = crcUpdate(crc, (uint8_t)((frame[13] >> 1) & 0x0F));              // src ssid
+  for (uint8_t k = 0;  k < 6;  k++)  crc = crcUpdate(crc, frame[k]);
+  for (uint8_t k = 7;  k < 13; k++)  crc = crcUpdate(crc, frame[k]);
+  crc = crcUpdate(crc, (uint8_t)((frame[13] >> 1) & 0x0F));
   for (uint16_t k = infoStart; k < len; k++) crc = crcUpdate(crc, frame[k]);
   return crc;
 }
@@ -484,66 +446,53 @@ void rememberPacket(uint16_t sig) {
   dupeIdx = (dupeIdx + 1) % DEDUPE_SIZE;
 }
 
-// Validate a WIDEn-N address. On success returns n and N (the SSID hop count).
 bool isWideN(const uint8_t *addr, uint8_t *n, uint8_t *N) {
   char c[6];
   for (uint8_t k = 0; k < 6; k++) c[k] = (char)((addr[k] >> 1) & 0x7F);
-  if (!(c[0] == 'W' && c[1] == 'I' && c[2] == 'D' && c[3] == 'E' &&
-        c[4] >= '1' && c[4] <= '7' && c[5] == ' '))
+  if (!(c[0] == 'W' && c[1] == 'I' && c[2] == 'D' && c[3] == 'E' && c[4] >= '1' && c[4] <= '7' && c[5] == ' '))
     return false;
   *n = c[4] - '0';
   *N = (addr[6] >> 1) & 0x0F;
-  return (*N >= 1 && *N <= *n);        // N must not exceed n
+  return (*N >= 1 && *N <= *n);
 }
 
-// New N-Paradigm digipeater. Acts on the FIRST not-yet-repeated hop:
-//   - exact MYCALL match      -> mark used, retransmit
-//   - exact plain-alias match -> substitute MYCALL*, retransmit
-//   - WIDEn-N, N == 1         -> substitute MYCALL*, retransmit
-//   - WIDEn-N, N  > 1         -> decrement to WIDEn-(N-1), insert MYCALL* ahead
-// FILL mode handles WIDE1-1 only; WIDE mode handles WIDEn-N up to wideMax.
-// A 30 s content cache suppresses duplicates and breaks loops.
 void tryDigipeat(uint8_t *frame, uint16_t len) {
   if (!digiEnabled) return;
-
-  // Map the address field (dest, source, up to 8 digis).
   int addrCount = 0; uint16_t i = 0; bool foundEnd = false;
   while (i + 7 <= len && addrCount < 2 + 8) {
     addrCount++;
-    if (frame[i + 6] & 0x01) { foundEnd = true; break; }   // extension bit
+    if (frame[i + 6] & 0x01) { foundEnd = true; break; }
     i += 7;
   }
-  if (!foundEnd || addrCount < 3) return;             // need dest+source+>=1 digi
-  if (addrMatches(&frame[7], myCall, mySSID)) return; // never repeat ourselves
+  if (!foundEnd || addrCount < 3) return;
+  if (addrMatches(&frame[7], myCall, mySSID)) return;
 
-  // First hop that has NOT been repeated yet.
   int slot = -1;
   for (int a = 2; a < addrCount; a++)
     if (!(frame[a * 7 + 6] & 0x80)) { slot = a; break; }
-  if (slot < 0) return;                               // path exhausted, not ours
+  if (slot < 0) return;
 
   uint16_t off     = (uint16_t)slot * 7;
   bool     wasLast = frame[off + 6] & 0x01;
   uint8_t  digis   = addrCount - 2;
   bool     doTx    = false;
 
-  if (addrMatches(&frame[off], myCall, mySSID)) {              // routed to us
+  if (addrMatches(&frame[off], myCall, mySSID)) {
     frame[off + 6] |= 0x80;
     doTx = true;
   } else if (aliasEnabled && addrMatches(&frame[off], myAlias, myAliasSSID)) {
-    encodeAddress(myCall, mySSID, &frame[off], wasLast);       // alias -> our call
+    encodeAddress(myCall, mySSID, &frame[off], wasLast);
     frame[off + 6] |= 0x80;
     doTx = true;
   } else {
     uint8_t n, N;
     if (isWideN(&frame[off], &n, &N)) {
-      bool ok = (digiMode == DIGI_FILL) ? (n == 1 && N == 1)
-                                        : (N <= wideMax);
+      bool ok = (digiMode == DIGI_FILL) ? (n == 1 && N == 1) : (N <= wideMax);
       if (ok) {
-        if (N == 1) {                                          // final hop
+        if (N == 1) {
           encodeAddress(myCall, mySSID, &frame[off], wasLast);
           frame[off + 6] |= 0x80;
-        } else {                                               // hops remain
+        } else {
           frame[off + 6] = (((N - 1) & 0x0F) << 1) | 0x60 | (wasLast ? 0x01 : 0);
           if (digis < 8) insertAddress(frame, &len, off, myCall, mySSID, true);
         }
@@ -554,17 +503,15 @@ void tryDigipeat(uint8_t *frame, uint16_t len) {
   if (!doTx) return;
 
   uint16_t sig = packetSignature(frame, len);
-  if (sig && seenRecently(sig)) return;               // duplicate -> drop
+  if (sig && seenRecently(sig)) return;
   if (sig) rememberPacket(sig);
 
-  delay(random(60, 260));                             // brief anti-collision slot
+  delay(random(60, 260));
   sendAX25Frame(frame, len);
   Serial.println("\r\n[DIGI repeated]");
   if (currentMode == COMMAND) Serial.print("cmd: ");
 }
 
-// ---- Command helpers -------------------------------------------------------
-// Parse "CALL" or "CALL-SSID" into a 6-char callsign + SSID.
 void parseCallSSID(String token, char *callOut, uint8_t *ssidOut) {
   token.trim();
   int dash = token.indexOf('-');
@@ -576,7 +523,6 @@ void parseCallSSID(String token, char *callOut, uint8_t *ssidOut) {
   *ssidOut = s & 0x0F;
 }
 
-// Parse a comma-separated path list, e.g. "WIDE1-1,WIDE2-1".
 void setTxPath(String list) {
   list.trim();
   txPathCount = 0;
@@ -596,7 +542,7 @@ void setTxPath(String list) {
 }
 
 // ============================================================
-//  AX.25 v2.2 Connected Mode  (single link, mod-8)
+//  AX.25 v2.2 Connected Mode
 // ============================================================
 enum LinkState { LINK_DISC, LINK_SETUP, LINK_CONN, LINK_RELEASE };
 LinkState linkState = LINK_DISC;
@@ -604,30 +550,25 @@ LinkState linkState = LINK_DISC;
 char    peerCall[7] = "";
 uint8_t peerSSID = 0;
 
-// Path used for this connection (rebuilt into every frame we send)
 char    connPathCall[MAX_PATH][7];
 uint8_t connPathSSID[MAX_PATH];
 uint8_t connPathCount = 0;
 
-// Sequence state (mod 8)
 #define AX_MOD     8
 #define AX_WINDOW  4
 uint8_t v_s = 0, v_r = 0, v_a = 0;
 bool    peerBusy = false;
 bool    rejSent  = false;
 
-// Timers / retries (runtime-adjustable via FRACK / RETRY commands)
-#define T1_MS_DEF   4000UL    // default retransmit timeout (FRACK)
-#define T3_MS       180000UL  // idle link-check timer
-#define N2_DEF      10        // default max retries
+#define T1_MS_DEF   4000UL
+#define T3_MS       180000UL
+#define N2_DEF      10
 uint32_t frackMs  = T1_MS_DEF;
 uint8_t  retryMax = N2_DEF;
 uint32_t t1At = 0; bool t1On = false;
 uint32_t t3At = 0; bool t3On = false;
 uint8_t  n2 = 0;
 
-// Unacked I-frames (indexed by N(S)) + outbound segment queue.
-// PACLEN_MAX is the fixed buffer ceiling; paclen is the runtime limit.
 #define PACLEN_MAX 255
 #define PACLEN_DEF 128
 uint8_t paclen = PACLEN_DEF;
@@ -636,7 +577,6 @@ Seg     iStore[AX_MOD];
 Seg     txQ[AX_MOD];
 uint8_t txQHead = 0, txQTail = 0, txQCount = 0;
 
-// Control-field bases (P/F bit is 0x10)
 #define U_SABM 0x2F
 #define U_DISC 0x43
 #define U_DM   0x0F
@@ -650,7 +590,6 @@ uint8_t txQHead = 0, txQTail = 0, txQCount = 0;
 
 bool monitorOn = true;
 
-// MHEARD list
 #define MHEARD_SIZE 8
 char     heardCall[MHEARD_SIZE][10];
 uint32_t heardAt[MHEARD_SIZE];
@@ -659,7 +598,6 @@ uint8_t  heardCount = 0;
 static inline uint8_t seqAdd(uint8_t a, uint8_t b) { return (a + b) & (AX_MOD - 1); }
 static inline uint8_t outstanding(void)            { return (v_s - v_a) & (AX_MOD - 1); }
 
-// Is N(R) within the window (v_a .. v_s inclusive)?
 bool nrValid(uint8_t nr) {
   uint8_t d1 = (nr  - v_a) & (AX_MOD - 1);
   uint8_t d2 = (v_s - v_a) & (AX_MOD - 1);
@@ -675,7 +613,6 @@ void setPeer(const char *c, uint8_t s) { memset(peerCall, 0, 7); strncpy(peerCal
 bool samePeer(const char *c, uint8_t s) { return (strcmp(peerCall, c) == 0 && peerSSID == s); }
 void printPeer(void) { Serial.print(peerCall); if (peerSSID) { Serial.print("-"); Serial.print(peerSSID); } }
 
-// Store the reverse of a received frame's digipeater path for our replies.
 void storeReversePath(uint8_t *frame, int addrCount) {
   connPathCount = 0;
   for (int a = addrCount - 1; a >= 2 && connPathCount < MAX_PATH; a--) {
@@ -689,12 +626,11 @@ void storeReversePath(uint8_t *frame, int addrCount) {
   }
 }
 
-// Build dest=peer, src=me, + path, with command/response C bits. Returns length.
 uint16_t connHeader(uint8_t *f, bool isCommand) {
   encodeAddress(peerCall, peerSSID, &f[0], false);
   encodeAddress(myCall,   mySSID,   &f[7], connPathCount == 0);
-  if (isCommand) { f[6] |= 0x80; f[13] &= ~0x80; }   // command:  dest C=1, src C=0
-  else           { f[6] &= ~0x80; f[13] |= 0x80; }   // response: dest C=0, src C=1
+  if (isCommand) { f[6] |= 0x80; f[13] &= ~0x80; }
+  else           { f[6] &= ~0x80; f[13] |= 0x80; }
   uint16_t p = 14;
   for (uint8_t i = 0; i < connPathCount; i++) {
     encodeAddress(connPathCall[i], connPathSSID[i], &f[p], i == connPathCount - 1);
@@ -719,14 +655,13 @@ void sendS(uint8_t type, bool isCommand, bool pf) {
 
 void sendIFromStore(uint8_t ns, bool pf) {
   uint8_t f[80 + PACLEN_MAX];
-  uint16_t p = connHeader(f, true);                        // I-frames are commands
-  f[p++] = (v_r << 5) | (pf ? PF_BIT : 0) | (ns << 1);     // I control (bit0 = 0)
-  f[p++] = 0xF0;                                           // PID: no layer-3
+  uint16_t p = connHeader(f, true);
+  f[p++] = (v_r << 5) | (pf ? PF_BIT : 0) | (ns << 1);
+  f[p++] = 0xF0;
   for (uint8_t i = 0; i < iStore[ns].len; i++) f[p++] = iStore[ns].data[i];
   sendAX25Frame(f, p);
 }
 
-// Acknowledge everything up to nr-1.
 void ackUpTo(uint8_t nr) {
   if (!nrValid(nr)) return;
   while (v_a != nr) v_a = seqAdd(v_a, 1);
@@ -740,7 +675,6 @@ void retransmitFrom(uint8_t from) {
   t1Start();
 }
 
-// Turn queued segments into I-frames while the window has room.
 void pumpTx(void) {
   while (txQCount > 0 && outstanding() < AX_WINDOW && !peerBusy && linkState == LINK_CONN) {
     iStore[v_s] = txQ[txQHead];
@@ -764,7 +698,7 @@ bool enqueueData(const uint8_t *d, uint8_t len) {
 
 void connReset(void) {
   linkState = LINK_DISC;
-  linkConnected = false;                    // LED: back to idle
+  linkConnected = false;
   t1Stop(); t3Stop();
   v_s = v_r = v_a = 0; n2 = 0; peerBusy = false; rejSent = false;
   txQHead = txQTail = txQCount = 0;
@@ -782,7 +716,6 @@ void linkFailure(const char *why) {
   Serial.print("cmd: ");
 }
 
-// Record a heard station (from the source address) for MHEARD.
 void recordHeard(uint8_t *frame) {
   char cs[10]; int n = 0;
   for (int k = 0; k < 6; k++) { char c = (char)((frame[7 + k] >> 1) & 0x7F); if (c != ' ') cs[n++] = c; }
@@ -798,7 +731,6 @@ void recordHeard(uint8_t *frame) {
   }
 }
 
-// Parse and dispatch a received frame (terminal / connected mode).
 void ax25HandleRx(uint8_t *frame, uint16_t len) {
   int addrCount = 0; uint16_t i = 0; bool end = false;
   while (i + 7 <= len && addrCount < 2 + MAX_PATH) {
@@ -825,10 +757,9 @@ void ax25HandleRx(uint8_t *frame, uint16_t len) {
   bool srcC   = frame[13] & 0x80;
   bool isCmd  = destC && !srcC;
 
-  // ---- UI frame: monitor display ----
   if ((control & ~PF_BIT) == U_UI) {
     if (monitorOn) {
-      uint16_t infoOff = ctrlOff + 2;                 // control + PID
+      uint16_t infoOff = ctrlOff + 2;
       Serial.print("\r\n<UI "); Serial.print(srcCall);
       if (srcSSID) { Serial.print("-"); Serial.print(srcSSID); }
       Serial.print("> ");
@@ -838,20 +769,19 @@ void ax25HandleRx(uint8_t *frame, uint16_t len) {
     return;
   }
 
-  if (!destUs) return;                                // link frames must target us
-  if (addrMatches(&frame[7], myCall, mySSID)) return; // ignore our own echoes
+  if (!destUs) return;
+  if (addrMatches(&frame[7], myCall, mySSID)) return;
 
-  // ---- U frames ----
   if ((control & 0x03) == 0x03) {
     uint8_t u = control & ~PF_BIT;
     if (u == U_SABM) {
-      if (linkState == LINK_CONN && !samePeer(srcCall, srcSSID)) return;   // busy
+      if (linkState == LINK_CONN && !samePeer(srcCall, srcSSID)) return;
       setPeer(srcCall, srcSSID);
       storeReversePath(frame, addrCount);
       v_s = v_r = v_a = 0; n2 = 0; peerBusy = false; rejSent = false;
       txQHead = txQTail = txQCount = 0;
       linkState = LINK_CONN;
-      linkConnected = true;                 // LED: connected
+      linkConnected = true;
       sendU(U_UA, false, pf);
       t1Stop(); t3Start();
       Serial.print("\r\n*** CONNECTED to "); printPeer(); Serial.println();
@@ -865,7 +795,7 @@ void ax25HandleRx(uint8_t *frame, uint16_t len) {
     } else if (u == U_UA) {
       if (linkState == LINK_SETUP) {
         linkState = LINK_CONN; v_s = v_r = v_a = 0; n2 = 0; t1Stop(); t3Start();
-        linkConnected = true;               // LED: connected
+        linkConnected = true;
         Serial.print("\r\n*** CONNECTED to "); printPeer(); Serial.println();
         enterConnConverse();
       } else if (linkState == LINK_RELEASE) {
@@ -880,7 +810,6 @@ void ax25HandleRx(uint8_t *frame, uint16_t len) {
     return;
   }
 
-  // Not in a connected session: reject stray S/I with DM.
   if (linkState != LINK_CONN) {
     if (linkState == LINK_DISC && isCmd) {
       setPeer(srcCall, srcSSID); storeReversePath(frame, addrCount);
@@ -888,9 +817,8 @@ void ax25HandleRx(uint8_t *frame, uint16_t len) {
     }
     return;
   }
-  if (!samePeer(srcCall, srcSSID)) return;            // frame from a third party
+  if (!samePeer(srcCall, srcSSID)) return;
 
-  // ---- S frames ----
   if ((control & 0x03) == 0x01) {
     uint8_t nr = control >> 5;
     uint8_t s  = control & 0x0F;
@@ -898,27 +826,26 @@ void ax25HandleRx(uint8_t *frame, uint16_t len) {
     if      (s == S_RR)  { peerBusy = false; }
     else if (s == S_RNR) { peerBusy = true;  }
     else if (s == S_REJ) { peerBusy = false; retransmitFrom(nr); }
-    if (isCmd && pf) sendS(S_RR, false, true);        // answer poll
+    if (isCmd && pf) sendS(S_RR, false, true);
     pumpTx();
     if (v_a == v_s) t1Stop();
     t3Start();
     return;
   }
 
-  // ---- I frame ----
   if ((control & 0x01) == 0) {
     uint8_t ns = (control >> 1) & 0x07;
     uint8_t nr = (control >> 5) & 0x07;
     ackUpTo(nr);
-    if (ns == v_r) {                                  // in sequence -> deliver
-      uint16_t infoOff = ctrlOff + 2;                 // control + PID
+    if (ns == v_r) {
+      uint16_t infoOff = ctrlOff + 2;
       Serial.print("\r\n");
       for (uint16_t k = infoOff; k < len; k++) Serial.print((char)frame[k]);
       if (currentMode == COMMAND) Serial.print("\r\ncmd: ");
       v_r = seqAdd(v_r, 1);
       rejSent = false;
-      sendS(S_RR, false, pf);                         // ack (F=1 if it was a poll)
-    } else {                                          // out of sequence
+      sendS(S_RR, false, pf);
+    } else {
       if (!rejSent) { sendS(S_REJ, false, pf); rejSent = true; }
       else if (pf)  { sendS(S_RR,  false, true); }
     }
@@ -928,7 +855,6 @@ void ax25HandleRx(uint8_t *frame, uint16_t len) {
   }
 }
 
-// Periodic timer service (call every loop).
 void ax25Service(void) {
   uint32_t now = millis();
   if (t1On && (uint32_t)(now - t1At) >= frackMs) {
@@ -941,24 +867,23 @@ void ax25Service(void) {
     if      (linkState == LINK_SETUP)   { sendU(U_SABM, true, true); t1Start(); }
     else if (linkState == LINK_RELEASE) { sendU(U_DISC, true, true); t1Start(); }
     else if (linkState == LINK_CONN) {
-      if (v_a != v_s) retransmitFrom(v_a);            // go-back-N
+      if (v_a != v_s) retransmitFrom(v_a);
       else            { sendS(S_RR, true, true); t1Start(); }
     }
   }
   if (t3On && linkState == LINK_CONN && (uint32_t)(now - t3At) >= T3_MS) {
-    if (v_a == v_s) { sendS(S_RR, true, true); t1Start(); }   // idle poll
+    if (v_a == v_s) { sendS(S_RR, true, true); t1Start(); }
     t3Start();
   }
 }
 
-// ---- Command wrappers ----
 void cmdConnect(String arg) {
   arg.trim();
   if (arg.length() == 0) { Serial.println("Usage: CONNECT <call[-ssid]>"); return; }
   if (linkState != LINK_DISC) { Serial.println("Busy - DISCONNECT first."); return; }
   char c[7]; uint8_t s; parseCallSSID(arg, c, &s);
   setPeer(c, s);
-  connPathCount = txPathCount;                        // connect via the configured path
+  connPathCount = txPathCount;
   for (uint8_t i = 0; i < txPathCount; i++) { strncpy(connPathCall[i], txPathCalls[i], 7); connPathSSID[i] = txPathSSID[i]; }
   v_s = v_r = v_a = 0; n2 = 0; peerBusy = false; rejSent = false; txQHead = txQTail = txQCount = 0;
   linkState = LINK_SETUP;
@@ -1001,10 +926,8 @@ void cmdStatus(void) {
 }
 
 // ============================================================
-//  GPS  (NMEA 0183 decoder on a separate serial port)
+//  GPS
 // ============================================================
-// Extract comma-separated field `idx` (0 = sentence id) into out (respects
-// empty fields; stops at the '*' checksum delimiter).
 void nmeaField(const char *s, uint8_t idx, char *out, uint8_t outSize) {
   uint8_t f = 0, oi = 0;
   out[0] = '\0';
@@ -1014,7 +937,6 @@ void nmeaField(const char *s, uint8_t idx, char *out, uint8_t outSize) {
   }
 }
 
-// Validate the NMEA "*HH" checksum (XOR of everything between '$' and '*').
 bool nmeaChecksumOK(const char *s) {
   if (s[0] != '$') return false;
   uint8_t sum = 0; const char *p = s + 1;
@@ -1026,11 +948,11 @@ bool nmeaChecksumOK(const char *s) {
 
 void parseNMEA(const char *s) {
   if (!nmeaChecksumOK(s)) return;
-  const char *type = s + 3;               // skip '$' + 2-char talker (GP/GN/GL...)
+  const char *type = s + 3;
   char f[16];
 
-  if (strncmp(type, "RMC", 3) == 0) {     // Recommended Minimum -> position + validity
-    nmeaField(s, 2, f, sizeof(f));        // status A=valid V=void
+  if (strncmp(type, "RMC", 3) == 0) {
+    nmeaField(s, 2, f, sizeof(f));
     bool valid = (f[0] == 'A');
     if (valid) {
       nmeaField(s, 1, gpsUtc, sizeof(gpsUtc));
@@ -1041,8 +963,8 @@ void parseNMEA(const char *s) {
       gpsLastFixMs = millis();
     }
     gpsFixValid = valid;
-  } else if (strncmp(type, "GGA", 3) == 0) {  // fix quality, satellites, altitude
-    nmeaField(s, 6, f, sizeof(f));            // fix quality (0 = no fix)
+  } else if (strncmp(type, "GGA", 3) == 0) {
+    nmeaField(s, 6, f, sizeof(f));
     if (f[0] && f[0] != '0') {
       nmeaField(s, 7, f, sizeof(f)); gpsSats = (uint8_t)atoi(f);
       nmeaField(s, 9, gpsAlt, sizeof(gpsAlt));
@@ -1055,7 +977,6 @@ void parseNMEA(const char *s) {
 void gpsBegin(void) { gpsSerial.begin(gpsBaud); nmeaLen = 0; }
 void gpsEnd(void)   { gpsSerial.end(); gpsFixValid = false; }
 
-// Feed available GPS bytes into the line buffer (call every loop).
 void gpsService(void) {
   if (!gpsEnabled) return;
   while (gpsSerial.available()) {
@@ -1063,7 +984,7 @@ void gpsService(void) {
     if (c == '\r') continue;
     if (c == '\n') { if (nmeaLen > 0) { nmea[nmeaLen] = '\0'; parseNMEA(nmea); } nmeaLen = 0; }
     else if (nmeaLen < sizeof(nmea) - 1) nmea[nmeaLen++] = c;
-    else nmeaLen = 0;                     // overflow -> resync on next line
+    else nmeaLen = 0;
   }
 }
 
@@ -1088,105 +1009,115 @@ void cmdGpsStatus(void) {
 }
 
 // ============================================================
-//  RX: HDLC parser (called once per decoded data bit)
+//  Weather Service
+// ============================================================
+void wxService(void) {
+  if (wxMode != WX_SERIAL2) return;
+  
+  while (Serial2.available()) {
+    char c = Serial2.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      if (wxSerialLen > 0) {
+        wxSerialBuf[wxSerialLen] = '\0';
+        strncpy(wxData, wxSerialBuf, sizeof(wxData) - 1);
+        wxSerialLen = 0; // Reset for next line
+      }
+    } else if (wxSerialLen < sizeof(wxSerialBuf) - 1) {
+      wxSerialBuf[wxSerialLen++] = c;
+    }
+  }
+}
+
+// ============================================================
+//  RX: HDLC parser
 // ============================================================
 static inline void hdlcParse(uint8_t bit) {
   hdlcBits = (hdlcBits << 1) | (bit & 1);
 
-  if (hdlcBits == 0x7E) {                  // ---- FLAG (frame boundary) ----
+  if (hdlcBits == 0x7E) {
     if (rxReceiving && rxFrameLen >= 17 && !rxFrameReady) {
-      memcpy(rxFrame, rxFrameBuf, rxFrameLen);   // hand raw frame to main loop
+      memcpy(rxFrame, rxFrameBuf, rxFrameLen);
       rxRawLen = rxFrameLen;
-      rxFrameReady = true;                       // FCS is verified in loop()
+      rxFrameReady = true;
     }
-    rxReceiving = true;                    // this flag also opens the next frame
+    rxReceiving = true;
     rxFrameLen  = 0;
     rxByte      = 0;
     rxBitCount  = 0;
     return;
   }
 
-  if ((hdlcBits & 0x7F) == 0x7F) {         // ---- 7+ ones: abort / idle ----
+  if ((hdlcBits & 0x7F) == 0x7F) {
     rxReceiving = false;
     return;
   }
 
   if (!rxReceiving) return;
 
-  if ((hdlcBits & 0x3F) == 0x3E) return;   // stuffed 0 after five 1s -> discard
+  if ((hdlcBits & 0x3F) == 0x3E) return;
 
-  rxByte >>= 1;                            // AX.25 is LSB-first
+  rxByte >>= 1;
   if (hdlcBits & 0x01) rxByte |= 0x80;
   if (++rxBitCount >= 8) {
     if (rxFrameLen < MAX_FRAME) rxFrameBuf[rxFrameLen++] = rxByte;
-    else rxReceiving = false;             // overflow -> drop
+    else rxReceiving = false;
     rxBitCount = 0;
     rxByte = 0;
   }
 }
 
 // ============================================================
-//  Sample-rate ISR (SAMPLERATE Hz): TX DDS or RX demod
+//  Sample-rate ISR (SAMPLERATE Hz)
 // ============================================================
 void sampleISR(void) {
   if (transmitting) {
-    // ---- Transmit: clock the DDS one sample ----
     if (txSampleInBit == 0) {
       if (txBitIndex >= txBitCount) { txDone = true; return; }
       uint8_t bit = (txBitBuf[txBitIndex >> 3] >> (txBitIndex & 7)) & 1;
       txBitIndex++;
-      if (bit == 0) txMark = !txMark;                 // NRZI: 0 = tone change
+      if (bit == 0) txMark = !txMark;
       txPhaseInc = txMark ? MARK_INC : SPACE_INC;
     }
-    txPhase += txPhaseInc;                            // uint8 wraps mod SIN_LEN
+    txPhase += txPhaseInc;
     PwmTimer->setCaptureCompare(2, sineTable[txPhase], TICK_COMPARE_FORMAT);
     if (++txSampleInBit >= SAMPLESPERBIT) txSampleInBit = 0;
     return;
   }
 
-  // ---- Receive: read audio and demodulate ----
-  // Portable read. For lower jitter, configure ADC1 once for a fixed short
-  // sample time and replace this with a direct  (int16_t)ADC1->DR  read.
-  int16_t raw = analogRead(RX_PIN);        // 0..4095 (12-bit)
-  int8_t  s   = (int8_t)((raw >> 4) - 128);// center to signed 8-bit
+  int16_t raw = analogRead(RX_PIN);
+  int8_t  s   = (int8_t)((raw >> 4) - 128);
 
-  // Delay-line multiply frequency discriminator (delay = SAMPLESPERBIT/2)
   int8_t delayed = delayLine[delayPos];
   iirX[0] = iirX[1];
   iirX[1] = ((int16_t)delayed * s) >> 2;
   iirY[0] = iirY[1];
-  iirY[1] = iirX[0] + iirX[1] + (iirY[0] >> 1);   // 1-pole low-pass
+  iirY[1] = iirX[0] + iirX[1] + (iirY[0] >> 1);
   delayLine[delayPos] = s;
   delayPos = (delayPos + 1) & ((SAMPLESPERBIT / 2) - 1);
 
-  // Raw tone decision (sign of the discriminator output)
   sampledBits = (sampledBits << 1) | ((iirY[1] > 0) ? 1 : 0);
 
-  // Digital PLL: nudge phase toward the center of the bit on each edge
   if ((sampledBits ^ (sampledBits >> 1)) & 0x01) {
     if (currentPhase < PHASE_THRES) currentPhase += PHASE_INC;
     else                            currentPhase -= PHASE_INC;
   }
   currentPhase += PHASE_BITS;
 
-  if (currentPhase >= PHASE_MAX) {         // ---- once per bit ----
+  if (currentPhase >= PHASE_MAX) {
     currentPhase -= PHASE_MAX;
     actualBits <<= 1;
-    uint8_t b3 = sampledBits & 0x07;       // majority vote of last 3 samples
+    uint8_t b3 = sampledBits & 0x07;
     if (b3 == 0x07 || b3 == 0x06 || b3 == 0x05 || b3 == 0x03) actualBits |= 1;
-    // NRZI decode: transition -> 0, no transition -> 1
     uint8_t dataBit = ((actualBits ^ (actualBits >> 1)) & 0x01) ? 0 : 1;
     hdlcParse(dataBit);
   }
 }
 
-// ============================================================
-//  Deliver a validated frame to the host (KISS or terminal)
-// ============================================================
 void onRFDataReceived(uint8_t *frame, uint16_t len) {
   if (currentMode == KISS) {
     Serial.write(FEND);
-    Serial.write((uint8_t)0x00);           // KISS data-frame command
+    Serial.write((uint8_t)0x00);
     for (uint16_t i = 0; i < len; i++) {
       uint8_t c = frame[i];
       if (c == FEND)      { Serial.write(FESC); Serial.write(TFEND); }
@@ -1198,7 +1129,7 @@ void onRFDataReceived(uint8_t *frame, uint16_t len) {
     bool foundText = false;
     Serial.print("\r\n<RX> ");
     for (uint16_t i = 0; i + 1 < len; i++) {
-      if (frame[i] == 0x03 && frame[i + 1] == 0xF0) {   // UI control + PID
+      if (frame[i] == 0x03 && frame[i + 1] == 0xF0) {
         for (uint16_t j = i + 2; j < len; j++) Serial.print((char)frame[j]);
         foundText = true;
         break;
@@ -1220,32 +1151,28 @@ void setup() {
   digitalWrite(PTT_PIN, LOW);
 
   pinMode(LED_PIN, OUTPUT);
-  ledWrite(true);              // steady ON = ready / OK
+  ledWrite(true);
 
-  // Build the DDS sine table (centered on mid-scale)
   for (int i = 0; i < SIN_LEN; i++)
     sineTable[i] = (uint8_t)(128.0 + TX_AMPLITUDE * sin((2.0 * PI * i) / SIN_LEN));
 
-  // ADC
   analogReadResolution(12);
   pinMode(RX_PIN, INPUT_ANALOG);
-  randomSeed(micros());   // for the digipeater collision-avoidance slot
+  randomSeed(micros());
 
-  // PWM carrier on PA1 (TIM2 CH2)
   PwmTimer = new HardwareTimer(TIM2);
   PwmTimer->setMode(2, TIMER_OUTPUT_COMPARE_PWM1, TX_PIN);
   PwmTimer->setPrescaleFactor(1);
-  PwmTimer->setOverflow(PWM_TOP + 1, TICK_FORMAT);   // ARR = 255
+  PwmTimer->setOverflow(PWM_TOP + 1, TICK_FORMAT);
   PwmTimer->setCaptureCompare(2, PWM_TOP / 2, TICK_COMPARE_FORMAT);
   PwmTimer->resume();
 
-  // Sample-rate interrupt on TIM3
   SampleTimer = new HardwareTimer(TIM3);
   SampleTimer->setOverflow(SAMPLERATE, HERTZ_FORMAT);
   SampleTimer->attachInterrupt(sampleISR);
   SampleTimer->resume();
 
-  while (!Serial && millis() < 3000);   // native-USB CDC: wait briefly
+  while (!Serial && millis() < 3000);
 
   Serial.println("\r\n*** STM32 Blue Pill TNC (native AFSK1200) ***");
   Serial.println("Type HELP for commands.");
@@ -1253,30 +1180,29 @@ void setup() {
 }
 
 // ============================================================
-//  Main loop (state machine)
+//  Main loop
 // ============================================================
 void loop() {
   updateLED();
   ax25Service();
   gpsService();
+  wxService();
 
-  // Verified frame from the modem -> host (KISS) or link layer (terminal)
   if (rxFrameReady) {
     uint16_t len = rxRawLen;
     if (checkFCS(rxFrame, len)) {
       noteActivity();
       recordHeard(rxFrame);
       if (currentMode == KISS) {
-        onRFDataReceived(rxFrame, len - 2);          // raw frame to host
+        onRFDataReceived(rxFrame, len - 2);
       } else {
-        ax25HandleRx(rxFrame, len - 2);              // connected mode + monitor
+        ax25HandleRx(rxFrame, len - 2);
         if (digiEnabled) tryDigipeat(rxFrame, len - 2);
       }
     }
     rxFrameReady = false;
   }
 
-  // Periodic beacon (skipped in KISS mode -- the host handles beaconing there)
   if (beaconEnabled && currentMode != KISS &&
       (uint32_t)(millis() - lastBeaconMs) >= beaconInterval) {
     lastBeaconMs = millis();
@@ -1285,18 +1211,18 @@ void loop() {
 
   while (Serial.available() > 0) {
     uint8_t b = Serial.read();
-    noteActivity();                         // serial traffic
+    noteActivity();
 
     // ================= KISS MODE =================
     if (currentMode == KISS) {
       if (b == FEND) {
         if (inKissFrame && kissBufferIndex > 1) {
           uint8_t command = kissBuffer[0] & 0x0F;
-          if (command == 0x00) {                 // data frame -> transmit
+          if (command == 0x00) {
             sendAX25Frame(kissBuffer + 1, kissBufferIndex - 1);
-          } else if (command == 0x0F) {          // KISS "Return" -> exit
+          } else if (command == 0x0F) {
             currentMode = COMMAND;
-            linkConnected = false;               // LED: leave connected state
+            linkConnected = false;
             Serial.println("\r\nExited KISS Mode.");
             Serial.print("cmd: ");
           }
@@ -1317,21 +1243,21 @@ void loop() {
             escapeNext = false;
           }
           if (kissBufferIndex < sizeof(kissBuffer)) kissBuffer[kissBufferIndex++] = b;
-          else inKissFrame = false;              // overflow -> drop frame
+          else inKissFrame = false;
         }
       }
       continue;
     }
 
     // ============= COMMAND / CONVERSE MODE =============
-    if (b == 0x03 && currentMode == CONVERSE) {  // Ctrl+C -> command mode
+    if (b == 0x03 && currentMode == CONVERSE) {
       currentMode = COMMAND;
       inputLen = 0;
       Serial.print("\r\ncmd: ");
       continue;
     }
 
-    if (b != '\r' && b != '\n' && b != 0x03) Serial.print((char)b);  // echo
+    if (b != '\r' && b != '\n' && b != 0x03) Serial.print((char)b);
 
     if (b == '\n' || b == '\r') {
       if (inputLen == 0) {
@@ -1343,7 +1269,7 @@ void loop() {
       if (currentMode == CONVERSE) {
         Serial.println();
         if (linkState == LINK_CONN) {
-          if (inputLen < sizeof(inputBuffer) - 1) inputBuffer[inputLen++] = '\r'; // send CR
+          if (inputLen < sizeof(inputBuffer) - 1) inputBuffer[inputLen++] = '\r';
           uint16_t off = 0;
           while (off < inputLen) {
             uint16_t chunk = inputLen - off;
@@ -1356,10 +1282,10 @@ void loop() {
           }
           pumpTx();
         } else {
-          transmitTextPacket(inputBuffer, inputLen);   // unproto UI
+          transmitTextPacket(inputBuffer, inputLen);
         }
-      } else {  // COMMAND
-        String raw = String(inputBuffer);       // original case (for BTEXT)
+      } else {
+        String raw = String(inputBuffer);
         raw.trim();
         String cmd = raw;
         cmd.toUpperCase();
@@ -1474,7 +1400,7 @@ void loop() {
         } else if (cmd == "SYMBOL") {
           Serial.print("Symbol: "); Serial.print(aprsSymTable); Serial.println(aprsSymCode);
         } else if (cmd.startsWith("SYMBOL ")) {
-          String s = raw.substring(7); s.trim();      // original case (codes are case-sensitive)
+          String s = raw.substring(7); s.trim();
           if (s.length() >= 2) {
             aprsSymTable = s.charAt(0);
             aprsSymCode  = s.charAt(1);
@@ -1482,12 +1408,27 @@ void loop() {
           } else {
             Serial.println("Usage: SYMBOL <table><code>   e.g. SYMBOL /-  (house), /> (car)");
           }
+        } else if (cmd == "WX OFF") {
+          wxMode = WX_OFF; 
+          Serial.println("Weather station disabled.");
+        } else if (cmd == "WX MANUAL") {
+          wxMode = WX_MANUAL; 
+          Serial.println("Weather mode: MANUAL.");
+        } else if (cmd == "WX SERIAL2") {
+          wxMode = WX_SERIAL2;
+          Serial2.begin(9600); // Set to match your hardware station's baud rate
+          Serial.println("Weather mode: SERIAL2 (9600 baud).");
+        } else if (cmd.startsWith("WX SET ")) {
+          String w = raw.substring(7);
+          w.trim();
+          w.toCharArray(wxData, sizeof(wxData));
+          Serial.print("Weather data set to: "); Serial.println(wxData);
         } else if (cmd == "CONV") {
           currentMode = CONVERSE;
           Serial.println("Entering Converse Mode (Ctrl+C to exit)");
         } else if (cmd == "KISS ON") {
           currentMode = KISS;
-          linkConnected = true;                  // LED: enter connected state
+          linkConnected = true;
           inKissFrame = false; kissBufferIndex = 0;
           Serial.println("Entering KISS Mode. Awaiting FEND frames.");
         } else if (cmd == "HELP") {
@@ -1505,6 +1446,10 @@ void loop() {
           Serial.println("  GPS BAUD <n>       - GPS serial speed (default 9600)");
           Serial.println("  GPS                - Show GPS status and current location");
           Serial.println("  SYMBOL <tbl><code> - APRS symbol, e.g. /- house, /> car");
+          Serial.println("  WX OFF             - Disable weather station telemetry");
+          Serial.println("  WX MANUAL          - Enable manual weather data entry via WX SET");
+          Serial.println("  WX SERIAL2         - Enable weather data parsing from USART2 (PA3)");
+          Serial.println("  WX SET <data>      - Set manual telemetry (e.g. 270/010g015t072...)");
           Serial.println("  MHEARD             - List stations heard (alias: MH)");
           Serial.println("  MONITOR ON | OFF   - Show/hide heard UI frames");
           Serial.println("  BTEXT <text>       - Set beacon text");
